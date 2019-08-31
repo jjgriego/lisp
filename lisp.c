@@ -5,6 +5,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdbool.h>
+#include <inttypes.h>
+
 
 #define not_reached() __builtin_unreachable()
 
@@ -63,7 +66,7 @@ struct pair_data;
 struct fun_data;
 struct closure_data;
 
-struct value {
+typedef struct value {
   union {
     int64_t i;               // NIL, BOOL, INT
     struct string_data *str; // STRING
@@ -72,7 +75,7 @@ struct value {
     struct closure_data *cls;// CLOSURE
   } data;
   enum datatype type;
-};
+} value;
 
 typedef int32_t refcount_t;
 #define PERSISTENT_REFCOUNT -1;
@@ -90,13 +93,13 @@ int32_t decref(int32_t rc) {
 }
 
 /* Helper functions to manage refcount */
-void incref_value(struct value val);
-int  decref_value(struct value val);
+void incref_value(value val);
+int  decref_value(value val);
 
 /*
  * Strings will be stored as a length-prefixed buffer of characters
  */
-struct string_data {
+typedef struct string_data {
   refcount_t refcount;
   /* The real length of the string */
   size_t length;
@@ -110,26 +113,26 @@ struct string_data {
    * still see this occasionally in practice
    */
   char data[];
-};
+} string_data;
 
 /* Forward-declaring some utilities for string_data */
-struct string_data *new_string(const char* buf, size_t len) {
-  struct string_data *s = malloc(sizeof(struct string_data) + len);
+string_data *new_string(const char* buf, size_t len) {
+  string_data *s = malloc(sizeof(string_data) + len);
   memcpy(s->data, buf, len);
   s->length = len;
   s->refcount = 1;
   return s;
 }
 
-struct string_data *new_string_cstr(const char* buf) {
+string_data *new_string_cstr(const char* buf) {
   return new_string(buf, strlen(buf));
 }
 
-void release_string(struct string_data *s) {
+void release_string(string_data *s) {
   free(s);
 }
 
-uint64_t string_hash(const struct string_data* str) {
+uint64_t string_hash(const string_data* str) {
   /* WARNING: very dumb hash algorithm ahead: */
   uint64_t val = 0;
   for (int i = 0; i < str->length; i++) {
@@ -138,7 +141,7 @@ uint64_t string_hash(const struct string_data* str) {
   return val;
 }
 
-int string_equal(const struct string_data* str1, const struct string_data *str2) {
+int string_equal(const string_data* str1, const string_data *str2) {
   if (str1->length != str2->length) return 0;
   return memcmp(str1->data, str2->data, str1->length) == 0;
 }
@@ -148,18 +151,18 @@ int string_equal(const struct string_data* str1, const struct string_data *str2)
  * accomplish this but for now, we can ignore this and just know that symbols
  * will also store a hash of ti heir string data
  */
-struct symbol_data {
+typedef struct symbol_data {
   size_t hash;
-  struct string_data *str;
+  string_data *str;
   struct symbol_data *next;
-};
+} symbol_data;
 
-struct symbol_data *g_last_symbol = 0;
+symbol_data *g_last_symbol = 0;
 
-struct symbol_data *new_symbol(const char *buf, size_t len) {
-  struct string_data *str = new_string(buf, len);
+symbol_data *new_symbol(const char *buf, size_t len) {
+  string_data *str = new_string(buf, len);
   int64_t hash = string_hash(str);
-  for (struct symbol_data *sym = g_last_symbol; sym; sym = sym->next) {
+  for (symbol_data *sym = g_last_symbol; sym; sym = sym->next) {
     if (sym->hash == hash &&
         string_equal(sym->str, str)) {
       assert(str->refcount == 1);
@@ -168,7 +171,7 @@ struct symbol_data *new_symbol(const char *buf, size_t len) {
     }
   }
   str->refcount = PERSISTENT_REFCOUNT;
-  struct symbol_data *sym = malloc(sizeof(struct symbol_data));
+  symbol_data *sym = malloc(sizeof(symbol_data));
   sym->hash = hash;
   sym->str = str;
   sym->next = g_last_symbol;
@@ -176,29 +179,52 @@ struct symbol_data *new_symbol(const char *buf, size_t len) {
   return sym;
 }
 
-struct symbol_data *new_symbol_cstr(const char *buf, size_t len) {
+symbol_data *new_symbol_cstr(const char *buf, size_t len) {
   return new_symbol(buf, strlen(buf));
 }
 
 /* Pairs are pretty straightforward */
-struct pair_data {
+typedef struct pair_data {
   refcount_t refcount;
-  struct value first;
-  struct value second;
-};
+  value first;
+  value second;
+} pair_data;
 
-struct pair_data *new_pair(struct value v1, struct value v2) {
-  struct pair_data *p = malloc(sizeof(struct pair_data));
+pair_data *new_pair(value v1, value v2) {
+  pair_data *p = malloc(sizeof(pair_data));
   p->refcount = 1;
   p->first = v1;
   p->second = v2;
   return p;
 }
 
-void release_pair(struct pair_data *p) {
+void release_pair(pair_data *p) {
   decref_value(p->first);
   decref_value(p->second);
   free(p);
+}
+
+bool list_length(pair_data *list_head, size_t* result) {
+  size_t tmp = 1;
+  pair_data *p = list_head;
+  while (1) {
+    switch (p->second.type) {
+    case DT_NIL:
+      if (result) *result = tmp;
+      return true;
+    case DT_PAIR:
+      p = p->second.data.pair;
+      tmp += 1;
+      continue;
+    case DT_BOOL:
+    case DT_STRING:
+    case DT_SYMBOL:
+    case DT_INT:
+    case DT_CLOSURE:
+      return false;
+    }
+    not_reached();
+  }
 }
 
 /* fun_data is a little more complicated since it has multiple slices of varying
@@ -208,29 +234,39 @@ void release_pair(struct pair_data *p) {
  *
  * | 8 bytes | 1 byte | 8 bytes       | 8 bytes    | ... | 1 byte | ...
  * | name    | arity  | bytecode_size | param_name | ... | bytecode ...
+ *
+ *
+ *
+ * If the fun has a native implementation it looks like this instead:
+ *
+ * | 8 bytes | 1 byte | 8 bytes       |
+ * | name    | arity  | impl address  |
  */
 
-struct fun_data {
-  struct string_data *name;
-  size_t bytecode_size;
+typedef uint8_t arity_t;
+typedef struct fun_data {
+  string_data *name;
   uint8_t captures;
-  uint8_t arity;
-};
+  arity_t arity;
+  size_t bytecode_size;
+} fun_data;
 
-struct string_data **fun_param_names(struct fun_data *f) {
-  return (struct string_data**)(f + 1);
+#define MAX_ARITY 0x100
+
+string_data **fun_param_names(fun_data *f) {
+  return (string_data**)(f + 1);
 }
 
-char* fun_bytecode(struct fun_data *f) {
+char* fun_bytecode(fun_data *f) {
   return ((char*)(fun_param_names(f)[f->arity]));
 }
 
-struct fun_data *new_fun(struct string_data *name,
-                         uint8_t arity, struct string_data **params,
+fun_data *new_fun(string_data *name,
+                         arity_t arity, string_data **params,
                          uint8_t captures,
                          size_t bytecode_size) {
-  struct fun_data *f = malloc(sizeof(struct fun_data) +
-                              sizeof(struct string_data*) * arity +
+  fun_data *f = malloc(sizeof(fun_data) +
+                              sizeof(string_data*) * arity +
                               bytecode_size);
   name->refcount = PERSISTENT_REFCOUNT;
   f->name = name;
@@ -239,37 +275,37 @@ struct fun_data *new_fun(struct string_data *name,
   f->bytecode_size = bytecode_size;
 
   for (int i = 0; i < arity; i++) {
-    struct string_data *param_name = params[i];
+    string_data *param_name = params[i];
     fun_param_names(f)[i] = param_name;
   }
 
   return f;
 }
 
-struct closure_data {
+typedef struct closure_data {
   refcount_t refcount;
-  struct fun_data *impl;
-  struct value captures[];
-};
+  fun_data *impl;
+  value captures[];
+} closure_data;
 
-struct closure_data *new_closure(struct fun_data *impl,
-                                 struct value *captures) {
-  struct closure_data *c = malloc(sizeof(struct closure_data) +
-                                  impl->captures * sizeof(struct value));
+closure_data *new_closure(fun_data *impl,
+                                 value *captures) {
+  closure_data *c = malloc(sizeof(closure_data) +
+                                  impl->captures * sizeof(value));
   c->refcount = 1;
   c->impl = impl;
-  memcpy(c->captures, captures, sizeof(struct value) * impl->captures);
+  memcpy(c->captures, captures, sizeof(value) * impl->captures);
   return c;
 }
 
-void release_closure(struct closure_data *c) {
+void release_closure(closure_data *c) {
   for (int i = 0; i < c->impl->captures; i++) {
     decref_value(c->captures[i]);
   }
   free(c);
 }
 
-void incref_value(struct value val) {
+void incref_value(value val) {
   switch (val.type) {
     // These types are guaranteed not to be refcounted
   case DT_NIL:
@@ -289,7 +325,7 @@ void incref_value(struct value val) {
   }
 }
 
-int decref_value(struct value val) {
+int decref_value(value val) {
   switch (val.type) {
     // These types are guaranteed not to be refcounted
   case DT_NIL:
@@ -345,7 +381,7 @@ int decref_value(struct value val) {
  * We're going to define the signature of the parser function as:
  *
  * int parse_sexpr(const char *buf, size_t len,
- *                 struct value *parse_result, struct parse_error *error)
+ *                 value *parse_result, struct parse_error *error)
  *
  * With the idea that the user passes in pointers to space where the error and
  * result structs must go--if the return is zero, the value struct is populated;
@@ -353,16 +389,16 @@ int decref_value(struct value val) {
  * the error struct now:
  */
 
-struct srcloc {
+typedef struct srcloc {
   size_t off;
   uint32_t line;
   uint32_t column;
-};
+} srcloc;
 
-struct parse_error {
-  struct string_data *message;
-  struct srcloc loc;
-};
+typedef struct parse_error {
+  string_data *message;
+  srcloc loc;
+} parse_error;
 
 /* The approach here is going to be a pretty simple LL(2) parse
  *
@@ -379,45 +415,45 @@ struct parse_error {
 
 struct parse_state;
 int parse_number(struct parse_state *s, int64_t *result);
-int parse_string(struct parse_state *s, struct string_data **result);
-int parse_symbol(struct parse_state *s, struct symbol_data **result);
+int parse_string(struct parse_state *s, string_data **result);
+int parse_symbol(struct parse_state *s, symbol_data **result);
 
-struct parse_tok {
-  struct srcloc loc;
+typedef struct parse_tok {
+  srcloc loc;
   enum tok_type {
     TOK_LPAREN,
     TOK_QUOTE,
     TOK_EXPR
   } type;
-  struct value data; /* valid for TOK_EXPR */
-};
+  value data; /* valid for TOK_EXPR */
+} parse_tok;
 
 /* The parse state, passed in an altered by all the helpers */
 
 #define PARSE_STACK_LIMIT 1024
 
-struct parse_state {
+typedef struct parse_state {
   const char* buf;
   const size_t len;
 
-  struct parse_error *err;
+  parse_error *err;
   int error_set; // nonzero if `err` has been assigned to
 
-  struct srcloc loc; // the current parse location
+  srcloc loc; // the current parse location
 
   size_t stack_top; // the first invalid stack element
-  struct parse_tok stack[PARSE_STACK_LIMIT];
-};
+  parse_tok stack[PARSE_STACK_LIMIT];
+} parse_state;
 
-static int parse_should_continue(struct parse_state *s) {
-  return !s->error_set && s->loc.off < s->len;
+static int parse_should_continue(parse_state *s) {
+  return !s->error_set && s->loc.off < s->len - 1;
 }
 
-static char parse_cur(struct parse_state *s) {
+static char parse_cur(parse_state *s) {
   return s->buf[s->loc.off];
 }
 
-static char parse_advance(struct parse_state *s) {
+static char parse_advance(parse_state *s) {
   char c = parse_cur(s);
   s->loc.off++;
   s->loc.column++;
@@ -425,42 +461,42 @@ static char parse_advance(struct parse_state *s) {
 }
 
 /* Halt with an error at the current srcloc */
-static void parse_error(struct parse_state *s, const char *msg) {
+static void parse_raise_error(parse_state *s, const char *msg) {
   s->error_set = 1;
-  *s->err = (struct parse_error) {
+  *s->err = (parse_error) {
     .message = new_string_cstr(msg),
     .loc     = s->loc
   };
 }
 
 /* Halt with an error at the given srcloc */
-static void parse_error_at(struct parse_state *s,
-                           struct srcloc loc, const char *msg) {
+static void parse_error_at(parse_state *s,
+                           srcloc loc, const char *msg) {
   s->error_set = 1;
-  *s->err = (struct parse_error) {
+  *s->err = (parse_error) {
     .message = new_string_cstr(msg),
     .loc     = loc
   };
 }
 
 /* Push to the parse stack */
-static void parse_push(struct parse_state *s, enum tok_type typ) {
+static void parse_push(parse_state *s, enum tok_type typ) {
   if (s->stack_top >= PARSE_STACK_LIMIT - 1) {
-    parse_error(s, "Parsing stack overflow");
+    parse_raise_error(s, "Parsing stack overflow");
   }
-  s->stack[s->stack_top++] = (struct parse_tok) {
+  s->stack[s->stack_top++] = (parse_tok) {
     .type = typ,
     .loc  = s->loc
   };
 }
 
 /* Push to the parse stack, with an additional data member */
-static void parse_push_expr(struct parse_state *s, struct srcloc start,
-                       struct value v) {
+static void parse_push_expr(parse_state *s, srcloc start,
+                       value v) {
   if (s->stack_top >= PARSE_STACK_LIMIT - 1) {
-    parse_error(s, "Parsing stack overflow");
+    parse_raise_error(s, "Parsing stack overflow");
   }
-  s->stack[s->stack_top++] = (struct parse_tok) {
+  s->stack[s->stack_top++] = (parse_tok) {
     .type = TOK_EXPR,
     .loc  = start,
     .data = v
@@ -468,11 +504,11 @@ static void parse_push_expr(struct parse_state *s, struct srcloc start,
 }
 
 /* Assert the given stack element is a TOK_EXPR and extract its data */
-static int parse_get_expr_at(struct parse_state *s,
-                             struct value *v,
+static int parse_get_expr_at(parse_state *s,
+                             value *v,
                              size_t stack_idx) {
   assert(stack_idx < s->stack_top);
-  struct parse_tok *t = &s->stack[stack_idx];
+  parse_tok *t = &s->stack[stack_idx];
   switch (t->type) {
   case TOK_EXPR:
     *v = t->data;
@@ -516,7 +552,7 @@ int is_symbol_start_char(char c) {
 }
 
 /* Consume characters from the input stream to parse a number */
-int parse_number(struct parse_state *s, int64_t *result) {
+int parse_number(parse_state *s, int64_t *result) {
   assert(is_digit(parse_cur(s)));
 
   *result = 0;
@@ -532,7 +568,7 @@ int parse_number(struct parse_state *s, int64_t *result) {
 }
 
 /* Consume characters from the input stream to parse a string */
-int parse_string(struct parse_state *s, struct string_data **result) {
+int parse_string(parse_state *s, string_data **result) {
   size_t start = s->loc.off + 1;
   size_t end = 0;
   for (int i = 0; i < s->len; i++) {
@@ -542,7 +578,7 @@ int parse_string(struct parse_state *s, struct string_data **result) {
     }
   }
   if (!end) {
-    parse_error(s, "Unterminated string literal");
+    parse_raise_error(s, "Unterminated string literal");
     return 0;
   } else {
     s->loc.off = end + 1;
@@ -552,7 +588,7 @@ int parse_string(struct parse_state *s, struct string_data **result) {
 }
 
 /* Consume characters from the input stream to parse a symbol */
-int parse_symbol(struct parse_state *s, struct symbol_data **result) {
+int parse_symbol(parse_state *s, symbol_data **result) {
   assert(is_symbol_start_char(parse_cur(s)));
 
   size_t start = s->loc.off;
@@ -566,7 +602,10 @@ int parse_symbol(struct parse_state *s, struct symbol_data **result) {
   return 1;
 }
 
-int parse_sexpr(struct parse_state *s, struct value *result) {
+/* The our grammar is LL(2) (and mostly LL(1)) so we can parse things quickly
+ * and easily by just peeking one character ahead and deciding which syntax rule
+ * to use */
+int parse_sexpr(parse_state *s, value *result) {
   char c;
   while (parse_should_continue(s)) {
     switch (c = parse_cur(s)) {
@@ -592,17 +631,17 @@ int parse_sexpr(struct parse_state *s, struct value *result) {
         if (s->stack[top].type == TOK_LPAREN) break;
       }
       if (s->stack[top].type != TOK_LPAREN) {
-        parse_error(s, "Unmatched RPAREN");
+        parse_raise_error(s, "Unmatched RPAREN");
       } else {
-        struct srcloc start = s->stack[top].loc;
+        srcloc start = s->stack[top].loc;
         /* everything from (top + 1) to old_top needs to go into a list
          * now */
-        struct value v = { .type = DT_NIL };
+        value v = { .type = DT_NIL };
         for (int i = old_top - 1; i > top; i--) {
           /* assert the element at stack[i] is a TOK_EXPR */
-          struct value v2;
+          value v2;
           if (parse_get_expr_at(s, &v2, i)) {
-            v = (struct value) {
+            v = (value) {
               .type = DT_PAIR,
               .data = { .pair = new_pair(v2, v) },
             };
@@ -615,12 +654,12 @@ int parse_sexpr(struct parse_state *s, struct value *result) {
     }
       break;
     case '\"': {
-      struct string_data *result;
-      struct srcloc start = s->loc;
+      string_data *result;
+      srcloc start = s->loc;
       if (parse_string(s, &result)) {
         parse_push_expr(s,
                         start,
-                        (struct value) { .type = DT_STRING,
+                        (value) { .type = DT_STRING,
                                          .data = { .str = result } });
         parse_advance(s);
       }
@@ -637,11 +676,11 @@ int parse_sexpr(struct parse_state *s, struct value *result) {
     case '8':
     case '9': {
       int64_t result;
-      struct srcloc start = s->loc;
+      srcloc start = s->loc;
       if (parse_number(s, &result)) {
         parse_push_expr(s,
                         start,
-                        (struct value) { .type = DT_INT,
+                        (value) { .type = DT_INT,
                                          .data = { .i = result } });
       }
       break;
@@ -652,20 +691,20 @@ int parse_sexpr(struct parse_state *s, struct value *result) {
       if (s->loc.off + 1 < s->len) {
         if (is_digit(s->buf[s->loc.off + 1])) {
           int64_t result;
-          struct srcloc start = s->loc;
+          srcloc start = s->loc;
           if (parse_number(s, &result)) {
             parse_push_expr(s,
                             start,
-                            (struct value) { .type = DT_INT,
+                            (value) { .type = DT_INT,
                                              .data = { .i = result } });
           }
         } else {
-          struct symbol_data *result;
-          struct srcloc start = s->loc;
+          symbol_data *result;
+          srcloc start = s->loc;
           if (parse_symbol(s, &result)) {
             parse_push_expr(s,
                             start,
-                            (struct value) { .type = DT_SYMBOL,
+                            (value) { .type = DT_SYMBOL,
                                              .data = { .sym = result } });
           }
         }
@@ -673,16 +712,16 @@ int parse_sexpr(struct parse_state *s, struct value *result) {
       break;
     default: {
       if (is_symbol_start_char(c)) {
-        struct symbol_data *result;
-        struct srcloc start = s->loc;
+        symbol_data *result;
+        srcloc start = s->loc;
         if (parse_symbol(s, &result)) {
           parse_push_expr(s,
                           start,
-                          (struct value) { .type = DT_SYMBOL,
+                          (value) { .type = DT_SYMBOL,
                                            .data = { .sym = result } });
         }
       } else {
-        parse_error(s, "Unexpected char");
+        parse_raise_error(s, "Unexpected char");
       }
       break;
     }
@@ -692,7 +731,7 @@ int parse_sexpr(struct parse_state *s, struct value *result) {
   /* Assert that the parse result is a single TOK_EXPR */
   if (!s->error_set) {
     if (s->stack_top == 0) {
-      parse_error(s, "Unexpected EOF");
+      parse_raise_error(s, "Unexpected EOF");
     } else {
       if (parse_get_expr_at(s, result, 0)) {
         if (s->stack_top > 1) {
@@ -725,8 +764,8 @@ int parse_sexpr(struct parse_state *s, struct value *result) {
 }
 
 int parse(const char *buf, size_t len,
-          struct parse_error *err, struct value *result) {
-  struct parse_state s = {
+          parse_error *err, value *result) {
+  parse_state s = {
     .buf = buf,
     .len = len,
     .loc = { .line = 1, .column = 1, .off = 0},
@@ -737,7 +776,9 @@ int parse(const char *buf, size_t len,
   return parse_sexpr(&s, result);
 }
 
-void print(struct value v) {
+/* This is mostly hanging around for debugging, but it's nice to be able to
+ * inspect s-expressions in an ad-hoc way */
+void print(value v) {
   switch(v.type) {
   case DT_NIL:
     printf("nil");
@@ -782,8 +823,8 @@ void print(struct value v) {
 /* We have a small problem, namely, that if we do the ~traditional~ thing and
  * write a pair of functions along the lines of:
  *
- * void eval(struct value v);
- * void apply(struct fun_data *f, struct value *values);
+ * void eval(value v);
+ * void apply(fun_data *f, value *values);
  *
  * ... then we have an important and tricky optimization to do; namely,
  * tail-call elimination. If we do the naive thing, we'll end up re-using the
@@ -796,20 +837,310 @@ void print(struct value v) {
  * then interpret that bytecode in a straightforward way.
  */
 
+enum opcode {
+  OP_NIL,
+  OP_BOOL,
+  OP_STRING,
+  OP_SYMBOL,
+  OP_INT,
+  OP_PAIR,
+  OP_CALL,
+  OP_ID,
+  OP_ALLOC_CLOSURE
+};
+
+typedef struct bytecode {
+  enum opcode opc;
+  union {
+    arity_t arity;           // OP_CALL
+    int64_t i;               // OP_INT, OP_BOOL
+    string_data *str; // OP_STRING
+    symbol_data *sym; // OP_SYMBOL, OP_ID
+    pair_data *pair;  // OP_PAIR
+    fun_data *fun;    // OP_ALLOC_CLOSURE
+  } data;
+} bytecode;
+
+/* Bytecode emitter
+ *
+ * We need a quasi-reasonable way to write bytecode without having to worry
+ * about the buffer size since the fun_data needs to be sized exactly.
+ */
+
+typedef struct bytecode_emitter {
+  char *buf;
+  char *start;
+  size_t cap;
+} bytecode_emitter;
+
+void bce_init(bytecode_emitter *bce) {
+  bce->start = (char *)malloc(sizeof(char) * 16);
+  bce->cap = 16;
+  bce->buf = bce->start;
+}
+
+void bce_grow(bytecode_emitter *bce) {
+  char* buf = realloc(bce->start, 2 * bce->cap);
+  size_t off = bce->buf - bce->start;
+  if (buf == bce->start) return;
+  memmove(buf, bce->start, off);
+  bce->start = buf;
+  bce->buf = bce->start + off;
+  bce->cap *= 2;
+}
+
+void bce_reset(bytecode_emitter *bce) {
+  bce->buf = bce->start;
+}
+
+void bce_free(bytecode_emitter *bce) {
+  if (bce->start) free(bce->start);
+}
+
+void bce_write(bytecode_emitter *bce, bytecode b) {
+  if (bce->buf - bce->start <= sizeof(bytecode)) {
+    bce_grow(bce);
+  }
+  *(bce->buf++) = b.opc;
+  switch (b.opc) {
+  case OP_NIL:
+    break;
+  case OP_INT:
+  case OP_BOOL:
+    *(int64_t *)(bce->buf) = b.data.i;
+    bce->buf += sizeof(int64_t);
+    break;
+  case OP_CALL:
+    *(arity_t *)(bce->buf) = b.data.arity;
+    bce->buf += sizeof(arity_t);
+    break;
+  case OP_STRING:
+    assert(b.data.str->refcount == REFCOUNT_STATIC);
+    *(string_data **)(bce->buf) = b.data.str;
+    bce->buf += sizeof(string_data *);
+    break;
+  case OP_SYMBOL:
+  case OP_ID:
+    *(symbol_data **)(bce->buf) = b.data.sym;
+    bce->buf += sizeof(symbol_data *);
+    break;
+  case OP_PAIR:
+    assert(b.data.pair->refcount == REFCOUNT_STATIC);
+    *(pair_data **)(bce->buf++) = b.data.pair;
+    bce->buf += sizeof(pair_data *);
+    break;
+  case OP_ALLOC_CLOSURE:
+    *(fun_data **)(bce->buf++) = b.data.fun;
+    bce->buf += sizeof(fun_data *);
+    break;
+  default:
+    not_reached();
+  }
+}
+
+void emit_panic(const char* message) {
+  printf("emit panic: %s\n", message);
+  abort();
+}
+
+void emit_expr(bytecode_emitter *bce, value v);
+void emit_funcall(bytecode_emitter *bce, value v);
+
+void emit_expr(bytecode_emitter *bce, value v) {
+  switch (v.type) {
+  case DT_NIL:
+    bce_write(bce, (bytecode){.opc = OP_NIL,});
+    break;
+  case DT_BOOL:
+    bce_write(bce, (bytecode){
+        .opc = OP_BOOL,
+        .data = {.i = v.data.i}
+      });
+    break;
+  case DT_STRING:
+    bce_write(bce, (bytecode){
+        .opc = OP_STRING,
+        .data = {.str = v.data.str}
+      });
+    break;
+  case DT_SYMBOL:
+    bce_write(bce, (bytecode){
+        .opc = OP_ID,
+        .data = {.sym = v.data.sym}
+      });
+    break;
+  case DT_INT:
+    bce_write(bce, (bytecode){
+        .opc = OP_INT,
+        .data = { .i = v.data.i }
+      });
+    break;
+  case DT_PAIR:
+    emit_funcall(bce, v);
+    break;
+  case DT_CLOSURE:
+    emit_panic("closure in emit syntax");
+    break;
+  default:
+    not_reached();
+  }
+}
+
+void emit_funcall(bytecode_emitter *bce, value v) {
+  assert(v.type == DT_PAIR);
+  emit_expr(bce, v.data.pair->first);
+  size_t arity;
+  if (!list_length(v.data.pair, &arity)) {
+    emit_panic("funcall is improper list");
+    return;
+  }
+  arity -= 1; /* don't count the fun expr */
+
+  pair_data *p = v.data.pair;
+  for (int i = 0; i < arity; i++) {
+    assert(p);
+    p = p->second.data.pair;
+    emit_expr(bce, p->first);
+  }
+
+  if (arity >= MAX_ARITY) {
+    emit_panic("funcall exceeds arity limits");
+    return;
+  }
+
+  bce_write(bce, (bytecode) {
+      .opc = OP_CALL,
+      .data = { .arity = (arity_t)arity }
+    });
+}
+
+const char* read_bytecode(const char* buf, bytecode* ret) {
+  assert(ret);
+  ret->opc = *(buf++);
+  switch (ret->opc) {
+  case OP_NIL:
+    break;
+  case OP_BOOL:
+  case OP_INT:
+    ret->data.i = *(const int64_t*)buf;
+    buf += sizeof(int64_t);
+    break;
+  case OP_STRING:
+    ret->data.str = *(string_data * const *)buf;
+    buf += sizeof(string_data*);
+    break;
+  case OP_SYMBOL:
+  case OP_ID:
+    ret->data.sym = *(symbol_data * const *)buf;
+    buf += sizeof(symbol_data*);
+    break;
+  case OP_PAIR:
+    ret->data.pair = *(pair_data * const *)buf;
+    buf += sizeof(pair_data*);
+    break;
+  case OP_CALL:
+    ret->data.arity = *(const arity_t*)buf;
+    buf += sizeof(arity_t);
+    break;
+  case OP_ALLOC_CLOSURE:
+    ret->data.fun = *(fun_data * const *)buf;
+    buf += sizeof(fun_data*);
+    break;
+  }
+  return buf;
+}
+
+void dump_bytecode(const char* buf, size_t len) {
+  bytecode b;
+  const char* data = buf;
+  printf("------------------------------------------------\n");
+  printf("bytecode (start %" PRIxPTR ", length %" PRIx64 ")", buf, len);
+  while (data < buf + len) {
+    data = read_bytecode(data, &b);
+    size_t offset = data - buf;
+    switch (b.opc) {
+    case OP_NIL:
+      printf("\n%d\tnil", offset);
+      break;
+    case OP_BOOL:
+      printf("\n%d\tbool 0x%" PRIx64, offset, b.data.i);
+      break;
+    case OP_STRING:
+      printf("\n%d\tstring 0x%" PRIxPTR "\n\t\t", offset, (uintptr_t)b.data.str);
+      print((value) {.type = DT_STRING, .data = {.str = b.data.str}});
+      break;
+    case OP_ID:
+      printf("\n%d\tid 0x%" PRIxPTR "\n\t\t", offset, (uintptr_t)b.data.sym);
+      print((value) {.type = DT_SYMBOL, .data = {.sym = b.data.sym}});
+      break;
+    case OP_SYMBOL:
+      printf("\n%d\tsymbol 0x%" PRIxPTR "\n\t\t", offset, (uintptr_t)b.data.sym);
+      print((value) {.type = DT_SYMBOL, .data = {.sym = b.data.sym}});
+      break;
+    case OP_INT:
+      printf("\n%d\tint 0x%" PRIx64, offset, b.data.i);
+      break;
+    case OP_PAIR:
+      printf("\n%d\tpair 0x%" PRIxPTR "\n\t\t", offset, (uintptr_t)b.data.pair);
+      print((value) {.type = DT_PAIR, .data = {.pair = b.data.pair}});
+      break;
+    case OP_CALL:
+      printf("\n%d\tcall %d", offset, b.data.arity);
+      break;
+    case OP_ALLOC_CLOSURE:
+      printf("\n%d\talloc_closure 0x%" PRIxPTR "\n", offset, (uintptr_t)b.data.fun);
+      break;
+    }
+  }
+  printf("\n");
+  fflush(stdout);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Bytecode interpreter
+////////////////////////////////////////////////////////////////////////////////
+
+typedef struct interp_state {
+  pair_data* global_bindings;
+} interp_state;
 
 int main(int argc, char** argv) {
-  struct parse_error err;
-  struct value val;
+  parse_error err;
+  value val;
 
-  const char *test = "(def (hello there) (+ 2 3))";
-  if (parse(test, strlen(test), &err, &val)) {
-    printf("error at (line %d, col %d, offset %ld)\n",
-           err.loc.line, err.loc.column, err.loc.off);
-    if (write(0, err.message->data, err.message->length) < 0) {
-      perror("write");
+  while (1) {
+    char *line = NULL;
+    size_t cap = 0;
+    size_t len = 0;
+    if ((len = getline(&line, &cap, stdin)) < 0) {
+      if (feof(stdin)) break;
+      perror("could not read line");
+      abort();
     }
-  } else {
-    print(val);
+
+    if (parse(line, len, &err, &val)) {
+      printf("error at (line %d, col %d, offset %ld)\n",
+             err.loc.line, err.loc.column, err.loc.off);
+      if (fwrite(err.message->data, 1, err.message->length, stdout) <
+          err.message->length) {
+        perror("write");
+        abort();
+      }
+      printf("\n");
+      fflush(stdin);
+    } else {
+      print(val);
+      printf("\n");
+      bytecode_emitter bce;
+      bce_init(&bce);
+      emit_expr(&bce, val);
+
+      dump_bytecode(bce.start, bce.buf - bce.start);
+
+      decref_value(val);
+      bce_free(&bce);
+    }
+    free(line);
   }
 }
 
