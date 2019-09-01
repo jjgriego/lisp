@@ -867,6 +867,7 @@ void print(value v) {
  */
 
 enum opcode {
+  OP_RET,
   OP_NIL,
   OP_BOOL,
   OP_STRING,
@@ -909,13 +910,11 @@ void bce_init(bytecode_emitter *bce) {
 }
 
 void bce_grow(bytecode_emitter *bce) {
-  char* buf = realloc(bce->start, 2 * bce->cap);
   size_t off = bce->buf - bce->start;
-  if (buf == bce->start) return;
-  memmove(buf, bce->start, off);
+  bce->cap *= 2;
+  char* buf = realloc(bce->start, bce->cap);
   bce->start = buf;
   bce->buf = bce->start + off;
-  bce->cap *= 2;
 }
 
 void bce_reset(bytecode_emitter *bce) {
@@ -932,8 +931,8 @@ void bce_write(bytecode_emitter *bce, bytecode b) {
   }
   *(bce->buf++) = b.opc;
   switch (b.opc) {
-  case OP_NIL:
-    break;
+  case OP_NIL: break;
+  case OP_RET: break;
   case OP_INT:
   case OP_BOOL:
     *(int64_t *)(bce->buf) = b.data.i;
@@ -1047,8 +1046,8 @@ const char* read_bytecode(const char* buf, bytecode* ret) {
   assert(ret);
   ret->opc = *(buf++);
   switch (ret->opc) {
-  case OP_NIL:
-    break;
+  case OP_NIL: break;
+  case OP_RET: break;
   case OP_BOOL:
   case OP_INT:
     ret->data.i = *(const int64_t*)buf;
@@ -1091,6 +1090,9 @@ void dump_bytecode(const char* buf, size_t len) {
     case OP_NIL:
       printf("\n%d\tnil", offset);
       break;
+    case OP_RET:
+      printf("\n%d\tret", offset);
+      break;
     case OP_BOOL:
       printf("\n%d\tbool 0x%" PRIx64, offset, b.data.i);
       break;
@@ -1121,6 +1123,7 @@ void dump_bytecode(const char* buf, size_t len) {
       break;
     }
   }
+  printf("\n------------------------------------------------\n\n");
   printf("\n");
   fflush(stdout);
 }
@@ -1184,6 +1187,18 @@ value interp_native_add(value v1, value v2) {
   return (value) { .type = DT_INT, .data = {.i = v1.data.i + v2.data.i}};
 }
 
+value interp_native_mul(value v1, value v2) {
+  if (v1.type != DT_INT) interp_panic("type error");
+  if (v2.type != DT_INT) interp_panic("type error");
+  return (value) { .type = DT_INT, .data = {.i = v1.data.i * v2.data.i}};
+}
+
+value interp_native_sub(value v1, value v2) {
+  if (v1.type != DT_INT) interp_panic("type error");
+  if (v2.type != DT_INT) interp_panic("type error");
+  return (value) { .type = DT_INT, .data = {.i = v1.data.i - v2.data.i}};
+}
+
 typedef struct native_fn_table_entry {
   const char *name;
   arity_t arity;
@@ -1191,6 +1206,8 @@ typedef struct native_fn_table_entry {
 } native_fn_table_entry;
 const native_fn_table_entry s_native_fn_table[] = {
   {"+", 2, interp_native_add},
+  {"-", 2, interp_native_sub},
+  {"*", 2, interp_native_mul},
   {0},
 };
 
@@ -1233,13 +1250,15 @@ value interp_pop(interp_state *is) {
 
 void interp_call(interp_state *is, arity_t arity);
 
-void interp_one(interp_state *is) {
+bool interp_one(interp_state *is) {
   bytecode b;
   is->pc = read_bytecode(is->pc, &b);
   switch (b.opc) {
   case OP_NIL:
     interp_push(is, (value) {.type = DT_NIL});
     break;
+  case OP_RET:
+    return true;
   case OP_INT:
     interp_push(is, (value) {.type = DT_INT, .data = {.i = b.data.i}});
     break;
@@ -1263,6 +1282,7 @@ void interp_one(interp_state *is) {
     interp_panic("unimplemented opcode 0x%x", b.opc);
     break;
   }
+  return false;
 }
 
 value interp_invoke_native(interp_state *is, closure_data *cls, arity_t arity) {
@@ -1338,16 +1358,16 @@ int main(int argc, char** argv) {
       bytecode_emitter bce;
       bce_init(&bce);
       emit_expr(&bce, val);
+      bce_write(&bce, (bytecode){ .opc = OP_RET });
 
       dump_bytecode(bce.start, bce.buf - bce.start);
 
       interp_state is;
       interp_init(&is, bce.start);
-      interp_one(&is);
-      interp_one(&is);
-      interp_one(&is);
-      interp_one(&is);
-
+      while (!interp_one(&is)) {}
+      assert(is.stack_ptr == 1);
+      print(interp_pop(&is));
+      printf("\n");
       decref_value(val);
       bce_free(&bce);
     }
