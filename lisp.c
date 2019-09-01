@@ -188,7 +188,7 @@ symbol_data *new_symbol(const char *buf, size_t len) {
   return sym;
 }
 
-symbol_data *new_symbol_cstr(const char *buf, size_t len) {
+symbol_data *new_symbol_cstr(const char *buf) {
   return new_symbol(buf, strlen(buf));
 }
 
@@ -1178,10 +1178,38 @@ typedef struct interp_state {
     abort(); \
     } while (0)
 
+value interp_native_add(value v1, value v2) {
+  if (v1.type != DT_INT) interp_panic("type error");
+  if (v2.type != DT_INT) interp_panic("type error");
+  return (value) { .type = DT_INT, .data = {.i = v1.data.i + v2.data.i}};
+}
+
+typedef struct native_fn_table_entry {
+  const char *name;
+  arity_t arity;
+  void *impl;
+} native_fn_table_entry;
+const native_fn_table_entry s_native_fn_table[] = {
+  {"+", 2, interp_native_add},
+  {0},
+};
+
+
 void interp_init(interp_state* is, const char* pc) {
   is->stack_ptr = 0;
   is->global_bindings = 0;
   is->pc = pc;
+
+  native_fn_table_entry *entry = &s_native_fn_table;
+  for (;entry->name; entry++) {
+    native_fun *f = (native_fun *)checked_malloc(sizeof(native_fun));
+    f->name = new_string_cstr(entry->name);
+    f->arity = entry->arity;
+    f->impl = entry->impl;
+    install_global_binding(&is->global_bindings,
+                           new_symbol_cstr(entry->name),
+                           (value) {.type = DT_CLOSURE, .data = {.cls = new_native_closure(f)}});
+  }
 }
 
 void interp_free(interp_state* is) {
@@ -1191,12 +1219,19 @@ void interp_push(interp_state *is, value v) {
   is->stack[is->stack_ptr++] = v;
 }
 
+value interp_peek(interp_state *is, size_t offset) {
+  assert(offset < is->stack_ptr);
+  return is->stack[is->stack_ptr - offset - 1];
+}
+
 value interp_pop(interp_state *is) {
   if (is->stack_ptr == 0) {
     interp_panic("pop: stack is empty");
   }
   return is->stack[--is->stack_ptr];
 }
+
+void interp_call(interp_state *is, arity_t arity);
 
 void interp_one(interp_state *is) {
   bytecode b;
@@ -1222,9 +1257,54 @@ void interp_one(interp_state *is) {
   case OP_SYMBOL:
   case OP_PAIR:
   case OP_CALL:
+    interp_call(is, b.data.arity);
+    break;
   case OP_ALLOC_CLOSURE:
     interp_panic("unimplemented opcode 0x%x", b.opc);
     break;
+  }
+}
+
+value interp_invoke_native(interp_state *is, closure_data *cls, arity_t arity) {
+  assert(cls->is_native);
+  native_fun *f = cls->impl.native_fun;
+  if (arity != f->arity) {
+    interp_panic("arity mismatch: %d given, %d expected (in native call to %*s)",
+                 arity,
+                 f->arity,
+                 f->name->length,
+                 &f->name->data);
+  }
+  switch (arity) {
+  case 0:
+    return ((value (*)())f->impl)();
+  case 1:
+    return ((value (*)(value))f->impl)(interp_peek(is, 0));
+  case 2:
+    return ((value (*)(value, value))f->impl)(interp_peek(is, 0), interp_peek(is, 1));
+  default:
+    interp_panic("nyi: higher arities");
+    break;
+  }
+}
+
+void interp_call(interp_state *is, arity_t arity) {
+  if (arity >= is->stack_ptr) {
+    interp_panic("stack depth too low for call");
+  }
+  value fn = interp_peek(is, arity);
+  if (fn.type != DT_CLOSURE) {
+    interp_panic("invalid type for call: 0x%x", fn.type);
+  }
+
+  if (fn.data.cls->is_native) {
+    value ret = interp_invoke_native(is, fn.data.cls, arity);
+    for (int i = 0; i < arity + 1; i++) {
+      interp_pop(is);
+    }
+    interp_push(is, ret);
+  } else {
+    interp_panic("nyi: non-native impls");
   }
 }
 
@@ -1263,6 +1343,9 @@ int main(int argc, char** argv) {
 
       interp_state is;
       interp_init(&is, bce.start);
+      interp_one(&is);
+      interp_one(&is);
+      interp_one(&is);
       interp_one(&is);
 
       decref_value(val);
