@@ -96,6 +96,15 @@ int32_t decref(int32_t rc) {
 void incref_value(value val);
 int  decref_value(value val);
 
+void *checked_malloc(size_t size) {
+  void *result = malloc(size);
+  if (!result) {
+    printf("panic: out of memory");
+    abort();
+  }
+  return result;
+}
+
 /*
  * Strings will be stored as a length-prefixed buffer of characters
  */
@@ -117,7 +126,7 @@ typedef struct string_data {
 
 /* Forward-declaring some utilities for string_data */
 string_data *new_string(const char* buf, size_t len) {
-  string_data *s = malloc(sizeof(string_data) + len);
+  string_data *s = checked_malloc(sizeof(string_data) + len);
   memcpy(s->data, buf, len);
   s->length = len;
   s->refcount = 1;
@@ -171,7 +180,7 @@ symbol_data *new_symbol(const char *buf, size_t len) {
     }
   }
   str->refcount = PERSISTENT_REFCOUNT;
-  symbol_data *sym = malloc(sizeof(symbol_data));
+  symbol_data *sym = checked_malloc(sizeof(symbol_data));
   sym->hash = hash;
   sym->str = str;
   sym->next = g_last_symbol;
@@ -191,7 +200,7 @@ typedef struct pair_data {
 } pair_data;
 
 pair_data *new_pair(value v1, value v2) {
-  pair_data *p = malloc(sizeof(pair_data));
+  pair_data *p = checked_malloc(sizeof(pair_data));
   p->refcount = 1;
   p->first = v1;
   p->second = v2;
@@ -265,7 +274,7 @@ fun_data *new_fun(string_data *name,
                          arity_t arity, string_data **params,
                          uint8_t captures,
                          size_t bytecode_size) {
-  fun_data *f = malloc(sizeof(fun_data) +
+  fun_data *f = checked_malloc(sizeof(fun_data) +
                               sizeof(string_data*) * arity +
                               bytecode_size);
   name->refcount = PERSISTENT_REFCOUNT;
@@ -282,24 +291,44 @@ fun_data *new_fun(string_data *name,
   return f;
 }
 
+typedef struct native_fun {
+  string_data *name;
+  arity_t arity;
+  void* impl;
+} native_fun;
+
 typedef struct closure_data {
   refcount_t refcount;
-  fun_data *impl;
+  bool is_native;
+  union {
+    fun_data *bc_fun;
+    native_fun *native_fun;
+  } impl;
   value captures[];
 } closure_data;
 
 closure_data *new_closure(fun_data *impl,
-                                 value *captures) {
-  closure_data *c = malloc(sizeof(closure_data) +
+                          value *captures) {
+  closure_data *c = checked_malloc(sizeof(closure_data) +
                                   impl->captures * sizeof(value));
   c->refcount = 1;
-  c->impl = impl;
+  c->is_native = false;
+  c->impl.bc_fun = impl;
   memcpy(c->captures, captures, sizeof(value) * impl->captures);
   return c;
 }
 
+closure_data *new_native_closure(native_fun *impl) {
+  closure_data *c = checked_malloc(sizeof(closure_data));
+  c->is_native = true;
+  c->refcount = 1;
+  c->impl.native_fun = impl;
+  return c;
+}
+
 void release_closure(closure_data *c) {
-  for (int i = 0; i < c->impl->captures; i++) {
+  size_t captures = c->is_native ? 0 : c->impl.bc_fun->captures;
+  for (int i = 0; i < captures; i++) {
     decref_value(c->captures[i]);
   }
   free(c);
@@ -874,7 +903,7 @@ typedef struct bytecode_emitter {
 } bytecode_emitter;
 
 void bce_init(bytecode_emitter *bce) {
-  bce->start = (char *)malloc(sizeof(char) * 16);
+  bce->start = (char *)checked_malloc(sizeof(char) * 16);
   bce->cap = 16;
   bce->buf = bce->start;
 }
@@ -1100,9 +1129,104 @@ void dump_bytecode(const char* buf, size_t len) {
 // Bytecode interpreter
 ////////////////////////////////////////////////////////////////////////////////
 
+bool lookup_binding(const pair_data *bindings, const symbol_data *name, value *result) {
+  assert(result);
+
+  const pair_data *p = bindings;
+  if (!p) return false;
+  while (1) {
+    assert(p->first.type == DT_PAIR);
+    const pair_data *assoc = p->first.data.pair;
+    assert(assoc->first.type == DT_SYMBOL);
+    if (assoc->first.data.sym == name) {
+      *result = assoc->second;
+      return true;
+    } else {
+      if (p->second.type == DT_PAIR) {
+        p = p->second.data.pair;
+      } else {
+        assert(p->second.type == DT_NIL);
+        return false;
+      }
+    }
+  }
+}
+
+void install_global_binding(pair_data **bindings, symbol_data* name, value val) {
+  incref_value(val);
+  pair_data *assoc = new_pair((value) {.type = DT_SYMBOL, .data = {.sym = name}}, val);
+  value rest = *bindings
+    ? (value) { .type = DT_PAIR, .data = {.pair = *bindings}}
+    : (value) { .type = DT_NIL };
+  pair_data *p = new_pair((value) { .type = DT_PAIR, .data = {.pair = assoc}}, rest);
+  *bindings = p;
+}
+
+#define IMPL_STACK_LIMIT 256
 typedef struct interp_state {
   pair_data* global_bindings;
+  const char* pc;
+  size_t stack_ptr;
+  value stack[IMPL_STACK_LIMIT];
 } interp_state;
+
+#define interp_panic(...) \
+  do { \
+    printf("interp panic: " __VA_ARGS__); \
+    printf("\n"); \
+    fflush(stdout); \
+    abort(); \
+    } while (0)
+
+void interp_init(interp_state* is, const char* pc) {
+  is->stack_ptr = 0;
+  is->global_bindings = 0;
+  is->pc = pc;
+}
+
+void interp_free(interp_state* is) {
+}
+
+void interp_push(interp_state *is, value v) {
+  is->stack[is->stack_ptr++] = v;
+}
+
+value interp_pop(interp_state *is) {
+  if (is->stack_ptr == 0) {
+    interp_panic("pop: stack is empty");
+  }
+  return is->stack[--is->stack_ptr];
+}
+
+void interp_one(interp_state *is) {
+  bytecode b;
+  is->pc = read_bytecode(is->pc, &b);
+  switch (b.opc) {
+  case OP_NIL:
+    interp_push(is, (value) {.type = DT_NIL});
+    break;
+  case OP_INT:
+    interp_push(is, (value) {.type = DT_INT, .data = {.i = b.data.i}});
+    break;
+  case OP_ID: {
+    value v;
+    if (!lookup_binding(is->global_bindings, b.data.sym, &v)) {
+      interp_panic("no binding for %*s",
+                   b.data.sym->str->length,
+                   &b.data.sym->str->data);
+    }
+    interp_push(is, v);
+  } break;
+  case OP_BOOL:
+  case OP_STRING:
+  case OP_SYMBOL:
+  case OP_PAIR:
+  case OP_CALL:
+  case OP_ALLOC_CLOSURE:
+    interp_panic("unimplemented opcode 0x%x", b.opc);
+    break;
+  }
+}
 
 int main(int argc, char** argv) {
   parse_error err;
@@ -1136,6 +1260,10 @@ int main(int argc, char** argv) {
       emit_expr(&bce, val);
 
       dump_bytecode(bce.start, bce.buf - bce.start);
+
+      interp_state is;
+      interp_init(&is, bce.start);
+      interp_one(&is);
 
       decref_value(val);
       bce_free(&bce);
