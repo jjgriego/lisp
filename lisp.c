@@ -45,7 +45,6 @@
 /*
  * This is the C type for our type tag--C supports enums which are just aliases
  * to an integer type
-.
  */
 enum datatype {
   DT_NIL,    // the null type, data member is invalid
@@ -119,8 +118,7 @@ typedef struct string_data {
    *
    * There's special restrictions around this idiom in the compiler but you
    * don't need to know about them now. (c.f. "flexible array members") You'll
-   * still see this occasionally in practice
-   */
+   * still see this occasionally in practice */
   char data[];
 } string_data;
 
@@ -158,7 +156,7 @@ int string_equal(const string_data* str1, const string_data *str2) {
 /*
  * Symbols are just interned strings. We'll add some machinery down the road to
  * accomplish this but for now, we can ignore this and just know that symbols
- * will also store a hash of ti heir string data
+ * will also store a hash of their string data
  */
 typedef struct symbol_data {
   size_t hash;
@@ -440,6 +438,7 @@ typedef struct parse_error {
  *  - peek at the first 1 or two charcters of the input stream
  *  - delegate to a parse helper (declared below) or push an LPAREN
  *  - right-paren consumes items off the stack until the previous LPAREN
+ *    and groups them into a list which goes on the stack
  */
 
 struct parse_state;
@@ -447,6 +446,8 @@ int parse_number(struct parse_state *s, int64_t *result);
 int parse_string(struct parse_state *s, string_data **result);
 int parse_symbol(struct parse_state *s, symbol_data **result);
 
+/* A token that goes on the parser stack--either an lparen, quote, or some
+ * complete expression */
 typedef struct parse_tok {
   srcloc loc;
   enum tok_type {
@@ -457,7 +458,7 @@ typedef struct parse_tok {
   value data; /* valid for TOK_EXPR */
 } parse_tok;
 
-/* The parse state, passed in an altered by all the helpers */
+/* The parse state, passed in and altered by all the helpers */
 
 #define PARSE_STACK_LIMIT 1024
 
@@ -1082,44 +1083,45 @@ void dump_bytecode(const char* buf, size_t len) {
   bytecode b;
   const char* data = buf;
   printf("------------------------------------------------\n");
-  printf("bytecode (start %" PRIxPTR ", length %" PRIx64 ")", buf, len);
+  printf("bytecode (start %" PRIxPTR ", length %" PRIx64 ")",
+         (uintptr_t)buf, len);
   while (data < buf + len) {
     data = read_bytecode(data, &b);
     size_t offset = data - buf;
     switch (b.opc) {
     case OP_NIL:
-      printf("\n%d\tnil", offset);
+      printf("\n%zu\tnil", offset);
       break;
     case OP_RET:
-      printf("\n%d\tret", offset);
+      printf("\n%zu\tret", offset);
       break;
     case OP_BOOL:
-      printf("\n%d\tbool 0x%" PRIx64, offset, b.data.i);
+      printf("\n%zu\tbool 0x%" PRIx64, offset, b.data.i);
       break;
     case OP_STRING:
-      printf("\n%d\tstring 0x%" PRIxPTR "\n\t\t", offset, (uintptr_t)b.data.str);
+      printf("\n%zu\tstring 0x%" PRIxPTR "\n\t\t", offset, (uintptr_t)b.data.str);
       print((value) {.type = DT_STRING, .data = {.str = b.data.str}});
       break;
     case OP_ID:
-      printf("\n%d\tid 0x%" PRIxPTR "\n\t\t", offset, (uintptr_t)b.data.sym);
+      printf("\n%zu\tid 0x%" PRIxPTR "\n\t\t", offset, (uintptr_t)b.data.sym);
       print((value) {.type = DT_SYMBOL, .data = {.sym = b.data.sym}});
       break;
     case OP_SYMBOL:
-      printf("\n%d\tsymbol 0x%" PRIxPTR "\n\t\t", offset, (uintptr_t)b.data.sym);
+      printf("\n%zu\tsymbol 0x%" PRIxPTR "\n\t\t", offset, (uintptr_t)b.data.sym);
       print((value) {.type = DT_SYMBOL, .data = {.sym = b.data.sym}});
       break;
     case OP_INT:
-      printf("\n%d\tint 0x%" PRIx64, offset, b.data.i);
+      printf("\n%zu\tint 0x%" PRIx64, offset, b.data.i);
       break;
     case OP_PAIR:
-      printf("\n%d\tpair 0x%" PRIxPTR "\n\t\t", offset, (uintptr_t)b.data.pair);
+      printf("\n%zu\tpair 0x%" PRIxPTR "\n\t\t", offset, (uintptr_t)b.data.pair);
       print((value) {.type = DT_PAIR, .data = {.pair = b.data.pair}});
       break;
     case OP_CALL:
-      printf("\n%d\tcall %d", offset, b.data.arity);
+      printf("\n%zu\tcall %d", offset, b.data.arity);
       break;
     case OP_ALLOC_CLOSURE:
-      printf("\n%d\talloc_closure 0x%" PRIxPTR "\n", offset, (uintptr_t)b.data.fun);
+      printf("\n%zu\talloc_closure 0x%" PRIxPTR "\n", offset, (uintptr_t)b.data.fun);
       break;
     }
   }
@@ -1217,15 +1219,17 @@ void interp_init(interp_state* is, const char* pc) {
   is->global_bindings = 0;
   is->pc = pc;
 
-  native_fn_table_entry *entry = &s_native_fn_table;
-  for (;entry->name; entry++) {
+  for (const native_fn_table_entry *entry = s_native_fn_table;
+       entry->name;
+       entry++) {
     native_fun *f = (native_fun *)checked_malloc(sizeof(native_fun));
     f->name = new_string_cstr(entry->name);
     f->arity = entry->arity;
     f->impl = entry->impl;
     install_global_binding(&is->global_bindings,
                            new_symbol_cstr(entry->name),
-                           (value) {.type = DT_CLOSURE, .data = {.cls = new_native_closure(f)}});
+                           (value) {.type = DT_CLOSURE,
+                                    .data = {.cls = new_native_closure(f)}});
   }
 }
 
@@ -1266,8 +1270,8 @@ bool interp_one(interp_state *is) {
     value v;
     if (!lookup_binding(is->global_bindings, b.data.sym, &v)) {
       interp_panic("no binding for %*s",
-                   b.data.sym->str->length,
-                   &b.data.sym->str->data);
+                   (int)b.data.sym->str->length, // XXX
+                   b.data.sym->str->data);
     }
     interp_push(is, v);
   } break;
@@ -1292,8 +1296,8 @@ value interp_invoke_native(interp_state *is, closure_data *cls, arity_t arity) {
     interp_panic("arity mismatch: %d given, %d expected (in native call to %*s)",
                  arity,
                  f->arity,
-                 f->name->length,
-                 &f->name->data);
+                 (int)f->name->length, // XXX
+                 f->name->data);
   }
   switch (arity) {
   case 0:
@@ -1301,7 +1305,8 @@ value interp_invoke_native(interp_state *is, closure_data *cls, arity_t arity) {
   case 1:
     return ((value (*)(value))f->impl)(interp_peek(is, 0));
   case 2:
-    return ((value (*)(value, value))f->impl)(interp_peek(is, 0), interp_peek(is, 1));
+    return ((value (*)(value, value))f->impl)(interp_peek(is, 0),
+                                              interp_peek(is, 1));
   default:
     interp_panic("nyi: higher arities");
     break;
