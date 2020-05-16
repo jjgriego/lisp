@@ -42,6 +42,8 @@
  * operations */
 #define REFCOUNT_STATIC -1
 
+////////////////////////////////////////////////////////////////////////////////
+
 /*
  * This is the C type for our type tag--C supports enums which are just aliases
  * to an integer type
@@ -76,6 +78,59 @@ typedef struct value {
   enum datatype type;
 } value;
 
+/* some helpers to make it easier to construct `value`s */
+
+value make_nil() {
+  value v;
+  v.type = DT_NIL;
+  v.data.i = 0;
+  return v;
+}
+
+value make_bool(bool b) {
+  value v;
+  v.type = DT_BOOL;
+  v.data.i = b;
+  return v;
+}
+
+value make_int(int64_t i) {
+  value v;
+  v.type = DT_INT;
+  v.data.i = i;
+  return v;
+}
+
+value make_string(struct string_data* s) {
+  value v;
+  v.type = DT_STRING;
+  v.data.str = s;
+  return v;
+}
+
+value make_symbol(struct symbol_data* s) {
+  value v;
+  v.type = DT_SYMBOL;
+  v.data.sym = s;
+  return v;
+}
+
+value make_pair(struct pair_data* p) {
+  value v;
+  v.type = DT_PAIR;
+  v.data.pair = p;
+  return v;
+}
+
+value make_closure(struct closure_data* cls) {
+  value v;
+  v.type = DT_CLOSURE;
+  v.data.cls = cls;
+  return v;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
 typedef int32_t refcount_t;
 #define PERSISTENT_REFCOUNT -1;
 
@@ -103,6 +158,8 @@ void *checked_malloc(size_t size) {
   }
   return result;
 }
+
+////////////////////////////////////////////////////////////////////////////////
 
 /*
  * Strings will be stored as a length-prefixed buffer of characters
@@ -153,6 +210,8 @@ int string_equal(const string_data* str1, const string_data *str2) {
   return memcmp(str1->data, str2->data, str1->length) == 0;
 }
 
+////////////////////////////////////////////////////////////////////////////////
+
 /*
  * Symbols are just interned strings. We'll add some machinery down the road to
  * accomplish this but for now, we can ignore this and just know that symbols
@@ -189,6 +248,8 @@ symbol_data *new_symbol(const char *buf, size_t len) {
 symbol_data *new_symbol_cstr(const char *buf) {
   return new_symbol(buf, strlen(buf));
 }
+
+////////////////////////////////////////////////////////////////////////////////
 
 /* Pairs are pretty straightforward */
 typedef struct pair_data {
@@ -233,6 +294,8 @@ bool list_length(pair_data *list_head, size_t* result) {
     not_reached();
   }
 }
+
+////////////////////////////////////////////////////////////////////////////////
 
 /* fun_data is a little more complicated since it has multiple slices of varying
  * length
@@ -295,6 +358,8 @@ typedef struct native_fun {
   void* impl;
 } native_fun;
 
+////////////////////////////////////////////////////////////////////////////////
+
 typedef struct closure_data {
   refcount_t refcount;
   bool is_native;
@@ -331,6 +396,8 @@ void release_closure(closure_data *c) {
   }
   free(c);
 }
+
+////////////////////////////////////////////////////////////////////////////////
 
 void incref_value(value val) {
   switch (val.type) {
@@ -666,15 +733,12 @@ int parse_sexpr(parse_state *s, value *result) {
         srcloc start = s->stack[top].loc;
         /* everything from (top + 1) to old_top needs to go into a list
          * now */
-        value v = { .type = DT_NIL };
+        value v = make_nil();
         for (int i = old_top - 1; i > top; i--) {
           /* assert the element at stack[i] is a TOK_EXPR */
           value v2;
           if (parse_get_expr_at(s, &v2, i)) {
-            v = (value) {
-              .type = DT_PAIR,
-              .data = { .pair = new_pair(v2, v) },
-            };
+            v = make_pair(new_pair(v2, v));
           }
         }
         s->stack_top = top;
@@ -689,8 +753,7 @@ int parse_sexpr(parse_state *s, value *result) {
       if (parse_string(s, &result)) {
         parse_push_expr(s,
                         start,
-                        (value) { .type = DT_STRING,
-                                         .data = { .str = result } });
+                        make_string(result));
         parse_advance(s);
       }
       break;
@@ -708,10 +771,7 @@ int parse_sexpr(parse_state *s, value *result) {
       int64_t result;
       srcloc start = s->loc;
       if (parse_number(s, &result)) {
-        parse_push_expr(s,
-                        start,
-                        (value) { .type = DT_INT,
-                                         .data = { .i = result } });
+        parse_push_expr(s, start, make_int(result));
       }
       break;
     }
@@ -723,19 +783,13 @@ int parse_sexpr(parse_state *s, value *result) {
           int64_t result;
           srcloc start = s->loc;
           if (parse_number(s, &result)) {
-            parse_push_expr(s,
-                            start,
-                            (value) { .type = DT_INT,
-                                             .data = { .i = result } });
+            parse_push_expr(s, start, make_int(result));
           }
         } else {
           symbol_data *result;
           srcloc start = s->loc;
           if (parse_symbol(s, &result)) {
-            parse_push_expr(s,
-                            start,
-                            (value) { .type = DT_SYMBOL,
-                                             .data = { .sym = result } });
+            parse_push_expr(s, start, make_symbol(result));
           }
         }
       }
@@ -745,10 +799,7 @@ int parse_sexpr(parse_state *s, value *result) {
         symbol_data *result;
         srcloc start = s->loc;
         if (parse_symbol(s, &result)) {
-          parse_push_expr(s,
-                          start,
-                          (value) { .type = DT_SYMBOL,
-                                           .data = { .sym = result } });
+          parse_push_expr(s, start, make_symbol(result));
         }
       } else {
         parse_raise_error(s, "Unexpected char");
@@ -1100,22 +1151,22 @@ void dump_bytecode(const char* buf, size_t len) {
       break;
     case OP_STRING:
       printf("\n%zu\tstring 0x%" PRIxPTR "\n\t\t", offset, (uintptr_t)b.data.str);
-      print((value) {.type = DT_STRING, .data = {.str = b.data.str}});
+      print(make_string(b.data.str));
       break;
     case OP_ID:
       printf("\n%zu\tid 0x%" PRIxPTR "\n\t\t", offset, (uintptr_t)b.data.sym);
-      print((value) {.type = DT_SYMBOL, .data = {.sym = b.data.sym}});
+      print(make_symbol(b.data.sym));
       break;
     case OP_SYMBOL:
       printf("\n%zu\tsymbol 0x%" PRIxPTR "\n\t\t", offset, (uintptr_t)b.data.sym);
-      print((value) {.type = DT_SYMBOL, .data = {.sym = b.data.sym}});
+      print(make_symbol(b.data.sym));
       break;
     case OP_INT:
       printf("\n%zu\tint 0x%" PRIx64, offset, b.data.i);
       break;
     case OP_PAIR:
       printf("\n%zu\tpair 0x%" PRIxPTR "\n\t\t", offset, (uintptr_t)b.data.pair);
-      print((value) {.type = DT_PAIR, .data = {.pair = b.data.pair}});
+      print(make_pair(b.data.pair));
       break;
     case OP_CALL:
       printf("\n%zu\tcall %d", offset, b.data.arity);
@@ -1159,11 +1210,9 @@ bool lookup_binding(const pair_data *bindings, const symbol_data *name, value *r
 
 void install_global_binding(pair_data **bindings, symbol_data* name, value val) {
   incref_value(val);
-  pair_data *assoc = new_pair((value) {.type = DT_SYMBOL, .data = {.sym = name}}, val);
-  value rest = *bindings
-    ? (value) { .type = DT_PAIR, .data = {.pair = *bindings}}
-    : (value) { .type = DT_NIL };
-  pair_data *p = new_pair((value) { .type = DT_PAIR, .data = {.pair = assoc}}, rest);
+  pair_data *assoc = new_pair(make_symbol(name), val);
+  value rest = *bindings ? make_pair(*bindings) : make_nil();
+  pair_data *p = new_pair(make_pair(assoc), rest);
   *bindings = p;
 }
 
@@ -1186,19 +1235,19 @@ typedef struct interp_state {
 value interp_native_add(value v1, value v2) {
   if (v1.type != DT_INT) interp_panic("type error");
   if (v2.type != DT_INT) interp_panic("type error");
-  return (value) { .type = DT_INT, .data = {.i = v1.data.i + v2.data.i}};
+  return make_int(v1.data.i + v2.data.i);
 }
 
 value interp_native_mul(value v1, value v2) {
   if (v1.type != DT_INT) interp_panic("type error");
   if (v2.type != DT_INT) interp_panic("type error");
-  return (value) { .type = DT_INT, .data = {.i = v1.data.i * v2.data.i}};
+  return make_int(v1.data.i * v2.data.i);
 }
 
 value interp_native_sub(value v1, value v2) {
   if (v1.type != DT_INT) interp_panic("type error");
   if (v2.type != DT_INT) interp_panic("type error");
-  return (value) { .type = DT_INT, .data = {.i = v1.data.i - v2.data.i}};
+  return make_int(v1.data.i - v2.data.i);
 }
 
 typedef struct native_fn_table_entry {
@@ -1228,8 +1277,7 @@ void interp_init(interp_state* is, const char* pc) {
     f->impl = entry->impl;
     install_global_binding(&is->global_bindings,
                            new_symbol_cstr(entry->name),
-                           (value) {.type = DT_CLOSURE,
-                                    .data = {.cls = new_native_closure(f)}});
+                           make_closure(new_native_closure(f)));
   }
 }
 
@@ -1259,12 +1307,12 @@ bool interp_one(interp_state *is) {
   is->pc = read_bytecode(is->pc, &b);
   switch (b.opc) {
   case OP_NIL:
-    interp_push(is, (value) {.type = DT_NIL});
+    interp_push(is, make_nil());
     break;
   case OP_RET:
     return true;
   case OP_INT:
-    interp_push(is, (value) {.type = DT_INT, .data = {.i = b.data.i}});
+    interp_push(is, make_int(b.data.i));
     break;
   case OP_ID: {
     value v;
