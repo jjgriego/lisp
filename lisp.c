@@ -1039,7 +1039,6 @@ void bce_write(bytecode_emitter *bce, bytecode b) {
     bce->buf += sizeof(arity_t);
     return;
   case OP_STRING:
-    assert(b.data.str->refcount == REFCOUNT_STATIC);
     *(string_data **)(bce->buf) = b.data.str;
     bce->buf += sizeof(string_data *);
     return;
@@ -1049,12 +1048,11 @@ void bce_write(bytecode_emitter *bce, bytecode b) {
     bce->buf += sizeof(symbol_data *);
     return;
   case OP_PAIR:
-    assert(b.data.pair->refcount == REFCOUNT_STATIC);
-    *(pair_data **)(bce->buf++) = b.data.pair;
+    *(pair_data **)(bce->buf) = b.data.pair;
     bce->buf += sizeof(pair_data *);
     return;
   case OP_ALLOC_CLOSURE:
-    *(fun_data **)(bce->buf++) = b.data.fun;
+    *(fun_data **)(bce->buf) = b.data.fun;
     bce->buf += sizeof(fun_data *);
     return;
   }
@@ -1134,13 +1132,16 @@ void emit_expr(emit_state *es, value v) {
           switch (quoted.type) {
           case DT_INT:
             bce_write(&es->bce, (bytecode) {OP_INT, {.i = quoted.data.i}});
+            return;
           case DT_PAIR:
             bce_write(&es->bce, (bytecode) {OP_PAIR, {.pair = quoted.data.pair}});
+            return;
           case DT_SYMBOL:
             bce_write(&es->bce, (bytecode) {OP_SYMBOL, {.sym = quoted.data.sym}});
+            return;
           case DT_STRING:
             bce_write(&es->bce, (bytecode) {OP_STRING, {.str = quoted.data.str}});
-
+            return;
           default:
             emit_panic(es, "bad quote");
           }
@@ -1606,6 +1607,18 @@ bool interp_one(interp_state *is) {
   case OP_INT:
     interp_push(is, make_int(b.data.i));
     break;
+  case OP_BOOL:
+    interp_push(is, make_bool(b.data.i));
+    break;
+  case OP_STRING:
+    interp_push(is, make_string(b.data.str));
+    break;
+  case OP_SYMBOL:
+    interp_push(is, make_symbol(b.data.sym));
+    break;
+  case OP_PAIR:
+    interp_push(is, make_pair(b.data.pair));
+    break;
   case OP_ID: {
     value v;
     if (!lookup_binding(is->global_bindings, b.data.sym, &v)) {
@@ -1615,10 +1628,6 @@ bool interp_one(interp_state *is) {
     }
     interp_push(is, v);
   } break;
-  case OP_BOOL:
-  case OP_STRING:
-  case OP_SYMBOL:
-  case OP_PAIR:
   case OP_CALL:
     interp_call(is, b.data.arity);
     break;
