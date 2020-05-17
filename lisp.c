@@ -11,6 +11,8 @@
 
 #define not_reached() __builtin_unreachable()
 
+#define IMPLIES(x, y) (!(x) || (y))
+
 /*
  * We're going to implement a simple lisp-like language interpreter, from
  * scratch, in C. This is more focused on a demonstration of basic ideas in
@@ -328,13 +330,14 @@ string_data **fun_param_names(fun_data *f) {
 }
 
 char* fun_bytecode(fun_data *f) {
-  return ((char*)(fun_param_names(f)[f->arity]));
+  return ((char*)(&fun_param_names(f)[f->arity]));
 }
 
 fun_data *new_fun(string_data *name,
-                         arity_t arity, string_data **params,
-                         uint8_t captures,
-                         size_t bytecode_size) {
+                  arity_t arity, string_data **params,
+                  uint8_t captures,
+                  const char* bytecode,
+                  size_t bytecode_size) {
   fun_data *f = checked_malloc(sizeof(fun_data) +
                               sizeof(string_data*) * arity +
                               bytecode_size);
@@ -343,6 +346,7 @@ fun_data *new_fun(string_data *name,
   f->arity = arity;
   f->captures = captures;
   f->bytecode_size = bytecode_size;
+  memcpy(fun_bytecode(f), bytecode, bytecode_size);
 
   for (int i = 0; i < arity; i++) {
     string_data *param_name = params[i];
@@ -1130,51 +1134,56 @@ const char* read_bytecode(const char* buf, bytecode* ret) {
   return buf;
 }
 
+void dump_opcode(bytecode b) {
+  switch (b.opc) {
+  case OP_NIL:
+    printf("nil");
+    break;
+  case OP_RET:
+    printf("ret");
+    break;
+  case OP_BOOL:
+    printf("bool 0x%" PRIx64, b.data.i);
+    break;
+  case OP_STRING:
+    printf("string 0x%" PRIxPTR " # ", (uintptr_t)b.data.str);
+    print(make_string(b.data.str));
+    break;
+  case OP_ID:
+    printf("id 0x%" PRIxPTR " # ", (uintptr_t)b.data.sym);
+    print(make_symbol(b.data.sym));
+    break;
+  case OP_SYMBOL:
+    printf("symbol 0x%" PRIxPTR " # ", (uintptr_t)b.data.sym);
+    print(make_symbol(b.data.sym));
+    break;
+  case OP_INT:
+    printf("int 0x%" PRIx64, b.data.i);
+    break;
+  case OP_PAIR:
+    printf("pair 0x%" PRIxPTR " # ", (uintptr_t)b.data.pair);
+    print(make_pair(b.data.pair));
+    break;
+  case OP_CALL:
+    printf("call %d", b.data.arity);
+    break;
+  case OP_ALLOC_CLOSURE:
+    printf("alloc_closure 0x%" PRIxPTR, (uintptr_t)b.data.fun);
+    break;
+  }
+}
+
 void dump_bytecode(const char* buf, size_t len) {
   bytecode b;
   const char* data = buf;
   printf("------------------------------------------------\n");
-  printf("bytecode (start %" PRIxPTR ", length %" PRIx64 ")",
+  printf("bytecode (start %" PRIxPTR ", length %" PRIx64 ")\n",
          (uintptr_t)buf, len);
   while (data < buf + len) {
     data = read_bytecode(data, &b);
-    size_t offset = data - buf;
-    switch (b.opc) {
-    case OP_NIL:
-      printf("\n%zu\tnil", offset);
-      break;
-    case OP_RET:
-      printf("\n%zu\tret", offset);
-      break;
-    case OP_BOOL:
-      printf("\n%zu\tbool 0x%" PRIx64, offset, b.data.i);
-      break;
-    case OP_STRING:
-      printf("\n%zu\tstring 0x%" PRIxPTR "\n\t\t", offset, (uintptr_t)b.data.str);
-      print(make_string(b.data.str));
-      break;
-    case OP_ID:
-      printf("\n%zu\tid 0x%" PRIxPTR "\n\t\t", offset, (uintptr_t)b.data.sym);
-      print(make_symbol(b.data.sym));
-      break;
-    case OP_SYMBOL:
-      printf("\n%zu\tsymbol 0x%" PRIxPTR "\n\t\t", offset, (uintptr_t)b.data.sym);
-      print(make_symbol(b.data.sym));
-      break;
-    case OP_INT:
-      printf("\n%zu\tint 0x%" PRIx64, offset, b.data.i);
-      break;
-    case OP_PAIR:
-      printf("\n%zu\tpair 0x%" PRIxPTR "\n\t\t", offset, (uintptr_t)b.data.pair);
-      print(make_pair(b.data.pair));
-      break;
-    case OP_CALL:
-      printf("\n%zu\tcall %d", offset, b.data.arity);
-      break;
-    case OP_ALLOC_CLOSURE:
-      printf("\n%zu\talloc_closure 0x%" PRIxPTR "\n", offset, (uintptr_t)b.data.fun);
-      break;
-    }
+    printf("%zu\t", data - buf);
+    dump_opcode(b);
+    printf("\n");
   }
   printf("\n------------------------------------------------\n\n");
   printf("\n");
@@ -1216,21 +1225,131 @@ void install_global_binding(pair_data **bindings, symbol_data* name, value val) 
   *bindings = p;
 }
 
-#define IMPL_STACK_LIMIT 256
+////////////////////////////////////////////////////////////////////////////////
+
+enum frame_flags {
+  FRAME_INVALID = 1 << 0,
+  /* indicates the frame is completely invalid */
+
+  FRAME_NATIVE = 1 << 1,
+  /* the frame was installed by native code--its `previous` is a native stack
+   * pointer or is completely invalid and its callee is a native_fun */
+
+  FRAME_ENTRY = 1 << 2,
+  /* the frame is a VM entry  */
+};
+
+/* a frame that will live on the VM stack--it's intentionally meant to be
+ * similar in flavor to a native x64 frame, at least to the extent that it
+ * can be backtraced through `previous` */
+typedef struct frame {
+  struct frame *previous;
+  const char* saved_pc;
+  enum frame_flags flags;
+  union {
+    fun_data *fun;
+    native_fun *native;
+  } callee;
+} frame;
+
+/* local ids involve several hacks--the first few locals alias into the frame
+ * so we must be careful not to access them */
+#define FIRST_VALID_LOCAL 2
+typedef int16_t local_t;
+
+/* a typical activation record of a function looks like this. Note that the
+ * negative local IDs correspond to arguments; the posive ones, to true locals.
+ * local IDs 0 and 1 are reserved since they alias the frame
+ *
+ *                  local ID
+ * +--------------+
+ * |  arg 0       |   -3
+ * |              |
+ * |              |
+ * |              |
+ * +--------------+ - - - - - -
+ * |  arg 1       |    -2
+ * |              |
+ * |              |
+ * |              |
+ * +--------------+ - - - - - -
+ * |  arg 2       |    -1
+ * |              |
+ * |              |
+ * |              |
+ * +--------------+ - - - - - -
+ * | saved frame  |     0
+ * |              |
+ * +--------------+
+ * | saved pc     |
+ * |              |
+ * +--------------+ - - - - - -
+ * | flags        |     1
+ * | and padding  |
+ * +--------------+
+ * | callee       |
+ * |              |
+ * +--------------+ - - - - - -
+ * |  local 0     |     2
+ * |              |
+ * |              |
+ * |              |
+ * +--------------+ - - - - - -
+ * |  local 1     |     3
+ * |              |
+ * |              |
+ * |              |
+ * +--------------+ - - - - - -
+ */
+
+arity_t frame_callee_arity(const frame* f) {
+  return (f->flags & FRAME_NATIVE)
+    ? f->callee.native->arity
+    : f->callee.fun->arity;
+}
+
 typedef struct interp_state {
   pair_data* global_bindings;
   const char* pc;
-  size_t stack_ptr;
-  value stack[IMPL_STACK_LIMIT];
+  value* sp;
+  frame* fp;
+  /* an allocation to hold the VM stack--note that the call stack need not
+   * contain only a single segment from this allocation--VM frames can
+   * interleave with native frames */
+  char* stack;
+  size_t stack_size;
 } interp_state;
 
-#define interp_panic(...) \
-  do { \
+#define interp_panic(...)                 \
+  do {                                    \
     printf("interp panic: " __VA_ARGS__); \
-    printf("\n"); \
-    fflush(stdout); \
-    abort(); \
-    } while (0)
+    printf("\n");                         \
+    fflush(stdout);                       \
+    abort();                              \
+  } while (0)
+
+bool interp_check_invariants(const interp_state *is) {
+  // stack ptr is in range:
+  assert((char*)is->sp >= is->stack &&
+         (char*)is->sp < is->stack + is->stack_size - sizeof(value));
+  // frame ptr is in range:
+  assert((char*)is->fp >= is->stack &&
+         (char*)is->fp < is->stack + is->stack_size - sizeof(frame));
+  // stack ptr is advanced past frame
+  assert((char*)is->sp >= (char*)(is->fp + 1));
+  // frame is not invalid:
+  assert(!(is->fp->flags & FRAME_INVALID));
+  // if frame isn't native, pc points into callee's bytecode
+  if (!(is->fp->flags & (FRAME_NATIVE | FRAME_ENTRY))) {
+    const char *pc = is->pc;
+    fun_data *f = is->fp->callee.fun;
+    const char* bc = fun_bytecode(f);
+    // note the pc is allowed to be just past-the-end because a trailing `ret`
+    // will leave it in that position
+    assert(pc >= bc && pc <= (bc + f->bytecode_size));
+  }
+  return true;
+}
 
 value interp_native_add(value v1, value v2) {
   if (v1.type != DT_INT) interp_panic("type error");
@@ -1250,67 +1369,137 @@ value interp_native_sub(value v1, value v2) {
   return make_int(v1.data.i - v2.data.i);
 }
 
-typedef struct native_fn_table_entry {
-  const char *name;
-  arity_t arity;
-  void *impl;
-} native_fn_table_entry;
-const native_fn_table_entry s_native_fn_table[] = {
-  {"+", 2, interp_native_add},
-  {"-", 2, interp_native_sub},
-  {"*", 2, interp_native_mul},
-  {0},
-};
 
+void interp_init_kernel(interp_state *is);
 
-void interp_init(interp_state* is, const char* pc) {
-  is->stack_ptr = 0;
+#define INTERP_STACK_SIZE 4096
+void interp_init(interp_state* is) {
+  // alloc the stack area
+  is->stack = checked_malloc(INTERP_STACK_SIZE);
+  is->stack_size = INTERP_STACK_SIZE;
+  // initialize the vm regs
+  is->sp = (value*)is->stack;
+  is->fp = (frame*)is->stack;
   is->global_bindings = 0;
-  is->pc = pc;
+  is->pc = 0;
 
-  for (const native_fn_table_entry *entry = s_native_fn_table;
-       entry->name;
-       entry++) {
-    native_fun *f = (native_fun *)checked_malloc(sizeof(native_fun));
-    f->name = new_string_cstr(entry->name);
-    f->arity = entry->arity;
-    f->impl = entry->impl;
-    install_global_binding(&is->global_bindings,
-                           new_symbol_cstr(entry->name),
-                           make_closure(new_native_closure(f)));
-  }
+  // load the global namespace
+  interp_init_kernel(is);
 }
 
 void interp_free(interp_state* is) {
 }
 
 void interp_push(interp_state *is, value v) {
-  is->stack[is->stack_ptr++] = v;
+  *(is->sp++) = v;
+  assert(interp_check_invariants(is));
 }
 
 value interp_peek(interp_state *is, size_t offset) {
-  assert(offset < is->stack_ptr);
-  return is->stack[is->stack_ptr - offset - 1];
+  assert(interp_check_invariants(is));
+  return *(is->sp - offset - 1);
+}
+
+value interp_get_local(interp_state *is, local_t idx) {
+  assert(interp_check_invariants(is));
+  assert(idx != 0 && idx != 1);
+  assert(IMPLIES(idx < 0, -idx < frame_callee_arity(is->fp)));
+  return *((value*)(is->fp) + idx);
 }
 
 value interp_pop(interp_state *is) {
-  if (is->stack_ptr == 0) {
-    interp_panic("pop: stack is empty");
-  }
-  return is->stack[--is->stack_ptr];
+  value ret = *(--is->sp);
+  assert(interp_check_invariants(is));
+  return ret;
 }
+
+void interp_push_frame(interp_state *is) {
+  frame* last = is->fp;
+  is->fp = (frame*)is->sp;
+  is->fp->flags = 0;
+  is->fp->previous = last;
+  is->fp->saved_pc = is->pc;
+  is->sp = (value*)(is->fp + 1); // TODO locals
+  // NB. the interp state is in an invalid state immediately after return--it is
+  // the caller's responsibility to fix the pc and frame's flags and callee to
+  // make the state valid again
+}
+
+void interp_pop_frame(interp_state *is) {
+  frame* old = is->fp;
+  is->fp = old->previous;
+  is->pc = old->saved_pc;
+  is->sp = (value*)old;
+
+  // if the frame wasn't an entry--tweak the stack by removing (but not
+  // decreffing) the closure and arguments
+  if (!(old->flags & FRAME_ENTRY)) {
+    is->sp -= frame_callee_arity(old) + 1;
+  }
+
+  // mark the old frame as explicitly dirty
+  old->flags = FRAME_INVALID;
+
+  assert(interp_check_invariants(is));
+}
+
+bool interp_one(interp_state *is);
+
+/* Configure the vm stack to call the given function with no arguments and then
+ * run the interpreter until the function returns */
+value interp_enter(interp_state* is, fun_data* callee) {
+  assert(callee->arity == 0);
+
+  interp_push_frame(is);
+  is->fp->flags = FRAME_ENTRY;
+  frame* entry = is->fp;
+
+  interp_push(is, make_nil()); // push the "callee closure"
+  interp_push_frame(is);
+  is->fp->flags = 0;
+  is->fp->callee.fun = callee;
+  is->pc = fun_bytecode(callee);
+
+  while (!(is->fp->flags & FRAME_ENTRY)) {
+    interp_one(is);
+  }
+
+  value ret = interp_pop(is);
+
+  assert(is->fp == entry);
+  // we would call interp_pop_frame here but we know this is the entry frame,
+  // which means:
+  // - there might not be a valid frame underneath
+  // - there are no locals nor parameters to move past
+  is->fp = entry->previous;
+  is->pc = entry->saved_pc;
+  is->sp = (value*)entry;
+
+  return ret;
+}
+
 
 void interp_call(interp_state *is, arity_t arity);
 
 bool interp_one(interp_state *is) {
   bytecode b;
   is->pc = read_bytecode(is->pc, &b);
+  printf("interp: ");
+  dump_opcode(b);
+  printf("\n");
   switch (b.opc) {
   case OP_NIL:
     interp_push(is, make_nil());
     break;
-  case OP_RET:
-    return true;
+  case OP_RET: {
+    // decref locals (TODO) and params
+
+    // top of stack is the return value
+    value v = interp_pop(is);
+    interp_pop_frame(is);
+    interp_push(is, v);
+    break;
+  }
   case OP_INT:
     interp_push(is, make_int(b.data.i));
     break;
@@ -1362,9 +1551,7 @@ value interp_invoke_native(interp_state *is, closure_data *cls, arity_t arity) {
 }
 
 void interp_call(interp_state *is, arity_t arity) {
-  if (arity >= is->stack_ptr) {
-    interp_panic("stack depth too low for call");
-  }
+  // XXX
   value fn = interp_peek(is, arity);
   if (fn.type != DT_CLOSURE) {
     interp_panic("invalid type for call: 0x%x", fn.type);
@@ -1380,6 +1567,32 @@ void interp_call(interp_state *is, arity_t arity) {
     interp_panic("nyi: non-native impls");
   }
 }
+
+typedef struct native_fn_table_entry {
+  const char *name;
+  arity_t arity;
+  void *impl;
+} native_fn_table_entry;
+const native_fn_table_entry s_native_fn_table[] =
+  {{"+", 2, interp_native_add},
+   {"-", 2, interp_native_sub},
+   {"*", 2, interp_native_mul},
+   {0}};
+
+void interp_init_kernel(interp_state *is) {
+  for (const native_fn_table_entry *entry = s_native_fn_table;
+       entry->name;
+       entry++) {
+    native_fun *f = (native_fun *)checked_malloc(sizeof(native_fun));
+    f->name = new_string_cstr(entry->name);
+    f->arity = entry->arity;
+    f->impl = entry->impl;
+    install_global_binding(&is->global_bindings,
+                           new_symbol_cstr(entry->name),
+                           make_closure(new_native_closure(f)));
+  }
+}
+
 
 int main(int argc, char** argv) {
   parse_error err;
@@ -1413,13 +1626,20 @@ int main(int argc, char** argv) {
       emit_expr(&bce, val);
       bce_write(&bce, (bytecode){ .opc = OP_RET });
 
-      dump_bytecode(bce.start, bce.buf - bce.start);
+
+      fun_data *f = new_fun(new_string_cstr("<eval>"),
+                            0, /*arity*/
+                            0, /*params*/
+                            0, /*captures*/
+                            bce.start,
+                            bce.buf - bce.start);
+      dump_bytecode(fun_bytecode(f), f->bytecode_size);
 
       interp_state is;
-      interp_init(&is, bce.start);
-      while (!interp_one(&is)) {}
-      assert(is.stack_ptr == 1);
-      print(interp_pop(&is));
+      interp_init(&is);
+
+      value ret = interp_enter(&is, f);
+      print(ret);
       printf("\n");
       decref_value(val);
       bce_free(&bce);
