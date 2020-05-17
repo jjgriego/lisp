@@ -251,6 +251,17 @@ symbol_data *new_symbol_cstr(const char *buf) {
   return new_symbol(buf, strlen(buf));
 }
 
+// now comes a parade of symbols used throughout the interpreter that need
+// initialization when the program starts
+
+static symbol_data *s_sym_lambda = 0;
+static symbol_data *s_sym_quote = 0;
+
+void symbol_init_symbol_table() {
+  s_sym_lambda = new_symbol_cstr("lambda");
+  s_sym_quote  = new_symbol_cstr("quote");
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 /* Pairs are pretty straightforward */
@@ -316,17 +327,19 @@ bool list_length(pair_data *list_head, size_t* result) {
  */
 
 typedef uint8_t arity_t;
+typedef int16_t local_t;
 typedef struct fun_data {
   string_data *name;
   uint8_t captures;
   arity_t arity;
+  local_t locals;
   size_t bytecode_size;
 } fun_data;
 
 #define MAX_ARITY 0x100
 
-string_data **fun_param_names(fun_data *f) {
-  return (string_data**)(f + 1);
+symbol_data **fun_param_names(fun_data *f) {
+  return (symbol_data**)(f + 1);
 }
 
 char* fun_bytecode(fun_data *f) {
@@ -334,25 +347,21 @@ char* fun_bytecode(fun_data *f) {
 }
 
 fun_data *new_fun(string_data *name,
-                  arity_t arity, string_data **params,
+                  arity_t arity, symbol_data **params,
+                  local_t locals,
                   uint8_t captures,
                   const char* bytecode,
                   size_t bytecode_size) {
   fun_data *f = checked_malloc(sizeof(fun_data) +
-                              sizeof(string_data*) * arity +
-                              bytecode_size);
+                               sizeof(symbol_data*) * arity +
+                               bytecode_size);
   name->refcount = PERSISTENT_REFCOUNT;
   f->name = name;
   f->arity = arity;
   f->captures = captures;
   f->bytecode_size = bytecode_size;
+  if (arity) memcpy(fun_param_names(f), params, sizeof(symbol_data*) * arity);
   memcpy(fun_bytecode(f), bytecode, bytecode_size);
-
-  for (int i = 0; i < arity; i++) {
-    string_data *param_name = params[i];
-    fun_param_names(f)[i] = param_name;
-  }
-
   return f;
 }
 
@@ -377,7 +386,7 @@ typedef struct closure_data {
 closure_data *new_closure(fun_data *impl,
                           value *captures) {
   closure_data *c = checked_malloc(sizeof(closure_data) +
-                                  impl->captures * sizeof(value));
+                                   impl->captures * sizeof(value));
   c->refcount = 1;
   c->is_native = false;
   c->impl.bc_fun = impl;
@@ -593,7 +602,7 @@ static void parse_push(parse_state *s, enum tok_type typ) {
 
 /* Push to the parse stack, with an additional data member */
 static void parse_push_expr(parse_state *s, srcloc start,
-                       value v) {
+                            value v) {
   if (s->stack_top >= PARSE_STACK_LIMIT - 1) {
     parse_raise_error(s, "Parsing stack overflow");
   }
@@ -648,7 +657,7 @@ int is_symbol_start_char(char c) {
     return 1;
   default:
     return (c >= 'a' && c <= 'z') ||
-           (c >= 'A' && c <= 'Z');
+      (c >= 'A' && c <= 'Z');
   }
 }
 
@@ -922,18 +931,47 @@ void print(value v) {
  * then interpret that bytecode in a straightforward way.
  */
 
+/*
+ * Let's take a moment to loosely specify both the bytecode language and the
+ * surface syntax we're compiling:
+ */
+
 enum opcode {
-  OP_RET,
-  OP_NIL,
-  OP_BOOL,
-  OP_STRING,
-  OP_SYMBOL,
-  OP_INT,
-  OP_PAIR,
-  OP_CALL,
-  OP_ID,
-  OP_ALLOC_CLOSURE
+  OP_RET,          // ret
+  /* Return from the current function, with the top of the stack as return
+   * value */
+  OP_NIL,          // nil
+  OP_BOOL,         // bool $bool
+  OP_STRING,       // string $str
+  OP_SYMBOL,       // symbol $sym
+  OP_INT,          // int $i
+  OP_PAIR,         // pair $pair
+  /* These opcodes push their corresponding literals to the stack */
+  OP_CALL,         // call $n
+  /* Pop `n` values off the stack, then one more which is a closure to be
+   * invoked with the previously-popped values as arguments */
+  OP_ID,           // id $sym
+  /* Retrieve the value with the given name from the current namespace */
+  OP_LOCAL,        // local $id
+  /* Retrieve the value with the given name from the current namespace */
+  OP_CAPTURE,      // capture $id
+  /* Pop a closure from the stack and retrieve the capture value with the given
+   * index */
+  OP_ALLOC_CLOSURE // alloc_closure $fun
+  /* Alloc a closure with the given function, popping $fun->captures additional
+   * values off the stack to form the closed-over identifiers  */
 };
+
+/*
+ * The language we're compiling has this grammar:
+ *
+ *
+ * <expr> ::= <number>
+ *          | <string>
+ *          | <symbol>                    -- variable reference
+ *          | (<expr> <expr> ...)         -- function application
+ *          | (lambda (param ...) <expr>) -- function abstraction
+ */
 
 typedef struct bytecode {
   enum opcode opc;
@@ -987,95 +1025,144 @@ void bce_write(bytecode_emitter *bce, bytecode b) {
   }
   *(bce->buf++) = b.opc;
   switch (b.opc) {
-  case OP_NIL: break;
-  case OP_RET: break;
+  case OP_NIL: return;
+  case OP_RET: return;
   case OP_INT:
   case OP_BOOL:
+  case OP_LOCAL:
+  case OP_CAPTURE:
     *(int64_t *)(bce->buf) = b.data.i;
     bce->buf += sizeof(int64_t);
-    break;
+    return;
   case OP_CALL:
     *(arity_t *)(bce->buf) = b.data.arity;
     bce->buf += sizeof(arity_t);
-    break;
+    return;
   case OP_STRING:
     assert(b.data.str->refcount == REFCOUNT_STATIC);
     *(string_data **)(bce->buf) = b.data.str;
     bce->buf += sizeof(string_data *);
-    break;
+    return;
   case OP_SYMBOL:
   case OP_ID:
     *(symbol_data **)(bce->buf) = b.data.sym;
     bce->buf += sizeof(symbol_data *);
-    break;
+    return;
   case OP_PAIR:
     assert(b.data.pair->refcount == REFCOUNT_STATIC);
     *(pair_data **)(bce->buf++) = b.data.pair;
     bce->buf += sizeof(pair_data *);
-    break;
+    return;
   case OP_ALLOC_CLOSURE:
     *(fun_data **)(bce->buf++) = b.data.fun;
     bce->buf += sizeof(fun_data *);
-    break;
-  default:
-    not_reached();
+    return;
   }
+
+  not_reached();
 }
 
-void emit_panic(const char* message) {
+typedef struct emit_state {
+  bytecode_emitter bce;
+  arity_t arity;
+  symbol_data **param_names;
+} emit_state;
+
+void emit_init(emit_state *es,
+               arity_t arity,
+               symbol_data **param_names) {
+  es->arity = arity;
+  es->param_names = param_names;
+  bce_init(&es->bce);
+}
+
+fun_data *emit_build_fun(emit_state *es) {
+  bce_write(&es->bce, (bytecode) {OP_RET});
+
+  fun_data *f = new_fun(new_string_cstr("<eval>"),
+                        es->arity,
+                        es->param_names,
+                        0, /* locals */
+                        0, /* captures*/
+                        es->bce.start,
+                        es->bce.buf - es->bce.start);
+  bce_free(&es->bce);
+
+  return f;
+}
+
+void emit_panic(emit_state* es, const char* message) {
   printf("emit panic: %s\n", message);
   abort();
 }
 
-void emit_expr(bytecode_emitter *bce, value v);
-void emit_funcall(bytecode_emitter *bce, value v);
+void emit_expr(emit_state *es, value v);
+void emit_lambda(emit_state *es, value v);
+void emit_funcall(emit_state *es, value v);
+void emit_var(emit_state *es, value v);
 
-void emit_expr(bytecode_emitter *bce, value v) {
+void emit_expr(emit_state *es, value v) {
   switch (v.type) {
   case DT_NIL:
-    bce_write(bce, (bytecode){.opc = OP_NIL,});
+    bce_write(&es->bce, (bytecode) {OP_NIL});
     break;
   case DT_BOOL:
-    bce_write(bce, (bytecode){
-        .opc = OP_BOOL,
-        .data = {.i = v.data.i}
-      });
+    bce_write(&es->bce, (bytecode) {OP_BOOL, {.i = v.data.i}});
     break;
   case DT_STRING:
-    bce_write(bce, (bytecode){
-        .opc = OP_STRING,
-        .data = {.str = v.data.str}
-      });
+    bce_write(&es->bce, (bytecode) {OP_STRING, {.str = v.data.str}});
     break;
   case DT_SYMBOL:
-    bce_write(bce, (bytecode){
-        .opc = OP_ID,
-        .data = {.sym = v.data.sym}
-      });
+    emit_var(es, v);
     break;
   case DT_INT:
-    bce_write(bce, (bytecode){
-        .opc = OP_INT,
-        .data = { .i = v.data.i }
-      });
+    bce_write(&es->bce, (bytecode) {OP_INT, { .i = v.data.i }});
     break;
   case DT_PAIR:
-    emit_funcall(bce, v);
+    // check for special forms
+    if (v.data.pair->first.type == DT_SYMBOL) {
+      symbol_data *s = v.data.pair->first.data.sym;
+      if (s == s_sym_lambda) {
+        emit_lambda(es, v);
+        break;
+      } else if (s == s_sym_quote) {
+        if (v.data.pair->second.type != DT_PAIR ||
+            v.data.pair->second.data.pair->second.type != DT_NIL) {
+          emit_panic(es, "bad syntax");
+        } else {
+          value quoted = v.data.pair->second.data.pair->first;
+          switch (quoted.type) {
+          case DT_INT:
+            bce_write(&es->bce, (bytecode) {OP_INT, {.i = quoted.data.i}});
+          case DT_PAIR:
+            bce_write(&es->bce, (bytecode) {OP_PAIR, {.pair = quoted.data.pair}});
+          case DT_SYMBOL:
+            bce_write(&es->bce, (bytecode) {OP_SYMBOL, {.sym = quoted.data.sym}});
+          case DT_STRING:
+            bce_write(&es->bce, (bytecode) {OP_STRING, {.str = quoted.data.str}});
+
+          default:
+            emit_panic(es, "bad quote");
+          }
+        }
+      }
+    }
+    emit_funcall(es, v);
     break;
   case DT_CLOSURE:
-    emit_panic("closure in emit syntax");
+    emit_panic(es, "closure in emit syntax");
     break;
   default:
     not_reached();
   }
 }
 
-void emit_funcall(bytecode_emitter *bce, value v) {
+void emit_funcall(emit_state *es, value v) {
   assert(v.type == DT_PAIR);
-  emit_expr(bce, v.data.pair->first);
+  emit_expr(es, v.data.pair->first);
   size_t arity;
   if (!list_length(v.data.pair, &arity)) {
-    emit_panic("funcall is improper list");
+    emit_panic(es, "funcall is improper list");
     return;
   }
   arity -= 1; /* don't count the fun expr */
@@ -1084,18 +1171,25 @@ void emit_funcall(bytecode_emitter *bce, value v) {
   for (int i = 0; i < arity; i++) {
     assert(p);
     p = p->second.data.pair;
-    emit_expr(bce, p->first);
+    emit_expr(es, p->first);
   }
 
   if (arity >= MAX_ARITY) {
-    emit_panic("funcall exceeds arity limits");
+    emit_panic(es, "funcall exceeds arity limits");
     return;
   }
 
-  bce_write(bce, (bytecode) {
-      .opc = OP_CALL,
-      .data = { .arity = (arity_t)arity }
-    });
+  bce_write(&es->bce, (bytecode) {OP_CALL, { .arity = (arity_t)arity }});
+}
+
+void emit_lambda(emit_state *es, value v) {
+  emit_panic(es, "nyi: lambda");
+}
+
+void emit_var(emit_state *es, value v) {
+
+  // default: look at top level
+  bce_write(&es->bce, (bytecode) {OP_ID, {.sym = v.data.sym}});
 }
 
 const char* read_bytecode(const char* buf, bytecode* ret) {
@@ -1106,6 +1200,8 @@ const char* read_bytecode(const char* buf, bytecode* ret) {
   case OP_RET: break;
   case OP_BOOL:
   case OP_INT:
+  case OP_LOCAL:
+  case OP_CAPTURE:
     ret->data.i = *(const int64_t*)buf;
     buf += sizeof(int64_t);
     break;
@@ -1152,6 +1248,12 @@ void dump_opcode(bytecode b) {
   case OP_ID:
     printf("id 0x%" PRIxPTR " # ", (uintptr_t)b.data.sym);
     print(make_symbol(b.data.sym));
+    break;
+  case OP_LOCAL:
+    printf("local 0x%" PRIx64, b.data.i);
+    break;
+  case OP_CAPTURE:
+    printf("capture 0x%" PRIx64, b.data.i);
     break;
   case OP_SYMBOL:
     printf("symbol 0x%" PRIxPTR " # ", (uintptr_t)b.data.sym);
@@ -1255,7 +1357,6 @@ typedef struct frame {
 /* local ids involve several hacks--the first few locals alias into the frame
  * so we must be careful not to access them */
 #define FIRST_VALID_LOCAL 2
-typedef int16_t local_t;
 
 /* a typical activation record of a function looks like this. Note that the
  * negative local IDs correspond to arguments; the posive ones, to true locals.
@@ -1522,6 +1623,8 @@ bool interp_one(interp_state *is) {
     interp_call(is, b.data.arity);
     break;
   case OP_ALLOC_CLOSURE:
+  case OP_LOCAL:
+  case OP_CAPTURE:
     interp_panic("unimplemented opcode 0x%x", b.opc);
     break;
   }
@@ -1602,6 +1705,9 @@ void interp_init_kernel(interp_state *is) {
 
 
 int main(int argc, char** argv) {
+
+  symbol_init_symbol_table();
+
   parse_error err;
   value val;
 
@@ -1628,19 +1734,12 @@ int main(int argc, char** argv) {
     } else {
       print(val);
       printf("\n");
-      bytecode_emitter bce;
-      bce_init(&bce);
-      emit_expr(&bce, val);
-      bce_write(&bce, (bytecode){ .opc = OP_RET });
 
+      emit_state es;
+      emit_init(&es, 0, 0);
+      emit_expr(&es, val);
+      fun_data *f = emit_build_fun(&es);
 
-      fun_data *f = new_fun(new_string_cstr("<eval>"),
-                            0, /*arity*/
-                            0, /*params*/
-                            0, /*captures*/
-                            bce.start,
-                            bce.buf - bce.start);
-      bce_free(&bce);
       dump_bytecode(fun_bytecode(f), f->bytecode_size);
 
       interp_state is;
