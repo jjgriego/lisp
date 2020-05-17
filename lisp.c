@@ -315,8 +315,8 @@ bool list_length(pair_data *list_head, size_t* result) {
  *
  * The layout of a fun is as follows:
  *
- * | 8 bytes | 1 byte | 8 bytes       | 8 bytes    | ... | 1 byte | ...
- * | name    | arity  | bytecode_size | param_name | ... | bytecode ...
+ * | 8 bytes | 1 byte | 8 bytes       | 1 byte | ...
+ * | name    | arity  | bytecode_size | bytecode ...
  *
  *
  *
@@ -328,26 +328,24 @@ bool list_length(pair_data *list_head, size_t* result) {
 
 typedef uint8_t arity_t;
 typedef int16_t local_t;
+typedef uint16_t capture_t;
 typedef struct fun_data {
   string_data *name;
-  uint8_t captures;
+  capture_t captures;
   arity_t arity;
   local_t locals;
   size_t bytecode_size;
+  pair_data *param_names;
 } fun_data;
 
 #define MAX_ARITY 0x100
 
-symbol_data **fun_param_names(fun_data *f) {
-  return (symbol_data**)(f + 1);
-}
-
 char* fun_bytecode(fun_data *f) {
-  return ((char*)(&fun_param_names(f)[f->arity]));
+  return (char*)(f + 1);
 }
 
 fun_data *new_fun(string_data *name,
-                  arity_t arity, symbol_data **params,
+                  arity_t arity, pair_data *param_names,
                   local_t locals,
                   uint8_t captures,
                   const char* bytecode,
@@ -360,7 +358,7 @@ fun_data *new_fun(string_data *name,
   f->arity = arity;
   f->captures = captures;
   f->bytecode_size = bytecode_size;
-  if (arity) memcpy(fun_param_names(f), params, sizeof(symbol_data*) * arity);
+  f->param_names = param_names;
   memcpy(fun_bytecode(f), bytecode, bytecode_size);
   return f;
 }
@@ -985,214 +983,6 @@ typedef struct bytecode {
   } data;
 } bytecode;
 
-/* Bytecode emitter
- *
- * We need a quasi-reasonable way to write bytecode without having to worry
- * about the buffer size since the fun_data needs to be sized exactly.
- */
-
-typedef struct bytecode_emitter {
-  char *buf;
-  char *start;
-  size_t cap;
-} bytecode_emitter;
-
-void bce_init(bytecode_emitter *bce) {
-  bce->start = (char *)checked_malloc(sizeof(char) * 16);
-  bce->cap = 16;
-  bce->buf = bce->start;
-}
-
-void bce_grow(bytecode_emitter *bce) {
-  size_t off = bce->buf - bce->start;
-  bce->cap *= 2;
-  char* buf = realloc(bce->start, bce->cap);
-  bce->start = buf;
-  bce->buf = bce->start + off;
-}
-
-void bce_reset(bytecode_emitter *bce) {
-  bce->buf = bce->start;
-}
-
-void bce_free(bytecode_emitter *bce) {
-  if (bce->start) free(bce->start);
-}
-
-void bce_write(bytecode_emitter *bce, bytecode b) {
-  if (bce->buf - bce->start <= sizeof(bytecode)) {
-    bce_grow(bce);
-  }
-  *(bce->buf++) = b.opc;
-  switch (b.opc) {
-  case OP_NIL: return;
-  case OP_RET: return;
-  case OP_INT:
-  case OP_BOOL:
-  case OP_LOCAL:
-  case OP_CAPTURE:
-    *(int64_t *)(bce->buf) = b.data.i;
-    bce->buf += sizeof(int64_t);
-    return;
-  case OP_CALL:
-    *(arity_t *)(bce->buf) = b.data.arity;
-    bce->buf += sizeof(arity_t);
-    return;
-  case OP_STRING:
-    *(string_data **)(bce->buf) = b.data.str;
-    bce->buf += sizeof(string_data *);
-    return;
-  case OP_SYMBOL:
-  case OP_ID:
-    *(symbol_data **)(bce->buf) = b.data.sym;
-    bce->buf += sizeof(symbol_data *);
-    return;
-  case OP_PAIR:
-    *(pair_data **)(bce->buf) = b.data.pair;
-    bce->buf += sizeof(pair_data *);
-    return;
-  case OP_ALLOC_CLOSURE:
-    *(fun_data **)(bce->buf) = b.data.fun;
-    bce->buf += sizeof(fun_data *);
-    return;
-  }
-
-  not_reached();
-}
-
-typedef struct emit_state {
-  bytecode_emitter bce;
-  arity_t arity;
-  symbol_data **param_names;
-} emit_state;
-
-void emit_init(emit_state *es,
-               arity_t arity,
-               symbol_data **param_names) {
-  es->arity = arity;
-  es->param_names = param_names;
-  bce_init(&es->bce);
-}
-
-fun_data *emit_build_fun(emit_state *es) {
-  bce_write(&es->bce, (bytecode) {OP_RET});
-
-  fun_data *f = new_fun(new_string_cstr("<eval>"),
-                        es->arity,
-                        es->param_names,
-                        0, /* locals */
-                        0, /* captures*/
-                        es->bce.start,
-                        es->bce.buf - es->bce.start);
-  bce_free(&es->bce);
-
-  return f;
-}
-
-void emit_panic(emit_state* es, const char* message) {
-  printf("emit panic: %s\n", message);
-  abort();
-}
-
-void emit_expr(emit_state *es, value v);
-void emit_lambda(emit_state *es, value v);
-void emit_funcall(emit_state *es, value v);
-void emit_var(emit_state *es, value v);
-
-void emit_expr(emit_state *es, value v) {
-  switch (v.type) {
-  case DT_NIL:
-    bce_write(&es->bce, (bytecode) {OP_NIL});
-    break;
-  case DT_BOOL:
-    bce_write(&es->bce, (bytecode) {OP_BOOL, {.i = v.data.i}});
-    break;
-  case DT_STRING:
-    bce_write(&es->bce, (bytecode) {OP_STRING, {.str = v.data.str}});
-    break;
-  case DT_SYMBOL:
-    emit_var(es, v);
-    break;
-  case DT_INT:
-    bce_write(&es->bce, (bytecode) {OP_INT, { .i = v.data.i }});
-    break;
-  case DT_PAIR:
-    // check for special forms
-    if (v.data.pair->first.type == DT_SYMBOL) {
-      symbol_data *s = v.data.pair->first.data.sym;
-      if (s == s_sym_lambda) {
-        emit_lambda(es, v);
-        break;
-      } else if (s == s_sym_quote) {
-        if (v.data.pair->second.type != DT_PAIR ||
-            v.data.pair->second.data.pair->second.type != DT_NIL) {
-          emit_panic(es, "bad syntax");
-        } else {
-          value quoted = v.data.pair->second.data.pair->first;
-          switch (quoted.type) {
-          case DT_INT:
-            bce_write(&es->bce, (bytecode) {OP_INT, {.i = quoted.data.i}});
-            return;
-          case DT_PAIR:
-            bce_write(&es->bce, (bytecode) {OP_PAIR, {.pair = quoted.data.pair}});
-            return;
-          case DT_SYMBOL:
-            bce_write(&es->bce, (bytecode) {OP_SYMBOL, {.sym = quoted.data.sym}});
-            return;
-          case DT_STRING:
-            bce_write(&es->bce, (bytecode) {OP_STRING, {.str = quoted.data.str}});
-            return;
-          default:
-            emit_panic(es, "bad quote");
-          }
-        }
-      }
-    }
-    emit_funcall(es, v);
-    break;
-  case DT_CLOSURE:
-    emit_panic(es, "closure in emit syntax");
-    break;
-  default:
-    not_reached();
-  }
-}
-
-void emit_funcall(emit_state *es, value v) {
-  assert(v.type == DT_PAIR);
-  emit_expr(es, v.data.pair->first);
-  size_t arity;
-  if (!list_length(v.data.pair, &arity)) {
-    emit_panic(es, "funcall is improper list");
-    return;
-  }
-  arity -= 1; /* don't count the fun expr */
-
-  pair_data *p = v.data.pair;
-  for (int i = 0; i < arity; i++) {
-    assert(p);
-    p = p->second.data.pair;
-    emit_expr(es, p->first);
-  }
-
-  if (arity >= MAX_ARITY) {
-    emit_panic(es, "funcall exceeds arity limits");
-    return;
-  }
-
-  bce_write(&es->bce, (bytecode) {OP_CALL, { .arity = (arity_t)arity }});
-}
-
-void emit_lambda(emit_state *es, value v) {
-  emit_panic(es, "nyi: lambda");
-}
-
-void emit_var(emit_state *es, value v) {
-
-  // default: look at top level
-  bce_write(&es->bce, (bytecode) {OP_ID, {.sym = v.data.sym}});
-}
-
 const char* read_bytecode(const char* buf, bytecode* ret) {
   assert(ret);
   ret->opc = *(buf++);
@@ -1291,6 +1081,417 @@ void dump_bytecode(const char* buf, size_t len) {
   printf("\n------------------------------------------------\n\n");
   printf("\n");
   fflush(stdout);
+}
+
+
+/* Bytecode emitter
+ *
+ * We need a quasi-reasonable way to write bytecode without having to worry
+ * about the buffer size since the fun_data needs to be sized exactly.
+ */
+
+typedef struct bytecode_emitter {
+  char *buf;
+  char *start;
+  size_t cap;
+} bytecode_emitter;
+
+void bce_init(bytecode_emitter *bce) {
+  bce->start = (char *)checked_malloc(sizeof(char) * 16);
+  bce->cap = 16;
+  bce->buf = bce->start;
+}
+
+void bce_grow(bytecode_emitter *bce) {
+  size_t off = bce->buf - bce->start;
+  bce->cap *= 2;
+  char* buf = realloc(bce->start, bce->cap);
+  bce->start = buf;
+  bce->buf = bce->start + off;
+}
+
+void bce_reset(bytecode_emitter *bce) {
+  bce->buf = bce->start;
+}
+
+void bce_free(bytecode_emitter *bce) {
+  if (bce->start) free(bce->start);
+}
+
+void bce_write(bytecode_emitter *bce, bytecode b) {
+  if (bce->buf - bce->start <= sizeof(bytecode)) {
+    bce_grow(bce);
+  }
+  *(bce->buf++) = b.opc;
+  switch (b.opc) {
+  case OP_NIL: return;
+  case OP_RET: return;
+  case OP_INT:
+  case OP_BOOL:
+  case OP_LOCAL:
+  case OP_CAPTURE:
+    *(int64_t *)(bce->buf) = b.data.i;
+    bce->buf += sizeof(int64_t);
+    return;
+  case OP_CALL:
+    *(arity_t *)(bce->buf) = b.data.arity;
+    bce->buf += sizeof(arity_t);
+    return;
+  case OP_STRING:
+    *(string_data **)(bce->buf) = b.data.str;
+    bce->buf += sizeof(string_data *);
+    return;
+  case OP_SYMBOL:
+  case OP_ID:
+    *(symbol_data **)(bce->buf) = b.data.sym;
+    bce->buf += sizeof(symbol_data *);
+    return;
+  case OP_PAIR:
+    *(pair_data **)(bce->buf) = b.data.pair;
+    bce->buf += sizeof(pair_data *);
+    return;
+  case OP_ALLOC_CLOSURE:
+    *(fun_data **)(bce->buf) = b.data.fun;
+    bce->buf += sizeof(fun_data *);
+    return;
+  }
+
+  not_reached();
+}
+
+typedef struct emit_state {
+  bytecode_emitter bce;
+  arity_t arity;
+  local_t locals;
+  pair_data *param_names;
+  pair_data *name_env;
+  pair_data *capture_list;
+} emit_state;
+
+void emit_panic(emit_state* es, const char* message);
+void emit_init(emit_state *es,
+               arity_t arity,
+               pair_data *param_names,
+               pair_data *name_env) {
+  es->arity = arity;
+  es->locals = 0;
+  es->param_names = param_names;
+
+  size_t env_size = 0;
+  if (name_env && !list_length(name_env, &env_size)) {
+    emit_panic(es, "name_env is an improper list");
+  }
+
+  { // extend the naming env with the parameters
+    local_t idx = -arity;
+    pair_data *env = 0;
+    pair_data *params = param_names;
+    while (params) {
+      assert(params->first.type == DT_SYMBOL);
+      symbol_data *name = params->first.data.sym;
+
+      // (cons (cons name idx) env)
+      env = new_pair(
+        make_pair(
+          new_pair(
+            make_symbol(name),
+            make_int(idx)
+          )
+        ),
+        env ? make_pair(env) : make_nil()
+      );
+
+      idx++;
+      if (params->second.type != DT_PAIR) {
+        assert(params->second.type == DT_NIL);
+        assert(idx == 0);
+        break;
+      }
+      params = params->second.data.pair;
+    }
+
+    es->name_env = new_pair(
+      env ? make_pair(env) : make_nil(),
+      name_env ? make_pair(name_env) : make_nil()
+    );
+  }
+
+  es->capture_list = 0;
+  bce_init(&es->bce);
+}
+
+void emit_free(emit_state *es) {
+  bce_free(&es->bce);
+}
+
+fun_data *emit_build_fun(emit_state *es) {
+  bce_write(&es->bce, (bytecode) {OP_RET});
+
+  size_t cap = 0;;
+  if (es->capture_list && !list_length(es->capture_list, &cap)) {
+    emit_panic(es, "capture list is improper");
+  }
+
+  fun_data *f = new_fun(new_string_cstr("<eval>"),
+                        es->arity,
+                        es->param_names,
+                        0, /* locals */
+                        cap,
+                        es->bce.start,
+                        es->bce.buf - es->bce.start);
+
+  emit_free(es);
+
+  dump_bytecode(fun_bytecode(f), f->bytecode_size);
+
+  return f;
+}
+
+
+void emit_panic(emit_state* es, const char* message) {
+  printf("emit panic: %s\n", message);
+  abort();
+}
+
+void emit_expr(emit_state *es, value v);
+void emit_lambda(emit_state *es, value v);
+void emit_funcall(emit_state *es, value v);
+void emit_var(emit_state *es, value v);
+
+void emit_push_closure(emit_state *es) {
+  bce_write(&es->bce, (bytecode) {OP_LOCAL, {.i = -es->arity - 1}});
+}
+
+capture_t find_capture(emit_state *es, symbol_data *name, int64_t scope);
+
+void emit_expr(emit_state *es, value v) {
+  switch (v.type) {
+  case DT_NIL:
+    bce_write(&es->bce, (bytecode) {OP_NIL});
+    break;
+  case DT_BOOL:
+    bce_write(&es->bce, (bytecode) {OP_BOOL, {.i = v.data.i}});
+    break;
+  case DT_STRING:
+    bce_write(&es->bce, (bytecode) {OP_STRING, {.str = v.data.str}});
+    break;
+  case DT_SYMBOL:
+    emit_var(es, v);
+    break;
+  case DT_INT:
+    bce_write(&es->bce, (bytecode) {OP_INT, { .i = v.data.i }});
+    break;
+  case DT_PAIR:
+    // check for special forms
+    if (v.data.pair->first.type == DT_SYMBOL) {
+      symbol_data *s = v.data.pair->first.data.sym;
+      if (s == s_sym_lambda) {
+        emit_lambda(es, v);
+        break;
+      } else if (s == s_sym_quote) {
+        if (v.data.pair->second.type != DT_PAIR ||
+            v.data.pair->second.data.pair->second.type != DT_NIL) {
+          emit_panic(es, "bad syntax");
+        } else {
+          value quoted = v.data.pair->second.data.pair->first;
+          switch (quoted.type) {
+          case DT_INT:
+            bce_write(&es->bce, (bytecode) {OP_INT, {.i = quoted.data.i}});
+            return;
+          case DT_PAIR:
+            bce_write(&es->bce, (bytecode) {OP_PAIR, {.pair = quoted.data.pair}});
+            return;
+          case DT_SYMBOL:
+            bce_write(&es->bce, (bytecode) {OP_SYMBOL, {.sym = quoted.data.sym}});
+            return;
+          case DT_STRING:
+            bce_write(&es->bce, (bytecode) {OP_STRING, {.str = quoted.data.str}});
+            return;
+          default:
+            emit_panic(es, "bad quote");
+          }
+        }
+      }
+    }
+    emit_funcall(es, v);
+    break;
+  case DT_CLOSURE:
+    emit_panic(es, "closure in emit syntax");
+    break;
+  default:
+    not_reached();
+  }
+}
+
+void emit_funcall(emit_state *es, value v) {
+  assert(v.type == DT_PAIR);
+  emit_expr(es, v.data.pair->first);
+  size_t arity;
+  if (!list_length(v.data.pair, &arity)) {
+    emit_panic(es, "funcall is improper list");
+    return;
+  }
+  arity -= 1; /* don't count the fun expr */
+
+  pair_data *p = v.data.pair;
+  for (int i = 0; i < arity; i++) {
+    assert(p);
+    p = p->second.data.pair;
+    emit_expr(es, p->first);
+  }
+
+  if (arity >= MAX_ARITY) {
+    emit_panic(es, "funcall exceeds arity limits");
+    return;
+  }
+
+  bce_write(&es->bce, (bytecode) {OP_CALL, { .arity = (arity_t)arity }});
+}
+
+void emit_lambda(emit_state *es, value v) {
+  pair_data *arglist = v.data.pair->second.data.pair->first.data.pair;
+  size_t arity;
+  if (!list_length(arglist, &arity)) {
+    emit_panic(es, "lambda: bad syntax");
+  }
+
+  // TODO should probably check the args are indeed a list of symbols
+
+  // open an emit context for the body
+  emit_state child;
+  emit_init(&child, arity, arglist, es->name_env);
+
+  // XXX: ugh this style
+  emit_expr(&child, v.data.pair->second.data.pair->second.data.pair->first);
+
+  // ok, push the captures (in reverse order)
+  pair_data *captured = child.capture_list;
+  capture_t count = 0;
+  while (captured) {
+    value capture = captured->first;
+    if (capture.type == DT_SYMBOL) {
+      // push the value of the capture
+      emit_var(es, make_symbol(captured->first.data.sym));
+    } else {
+      assert(capture.type == DT_INT);
+      // we must retrieve the appropriate scope
+      int64_t scope = capture.data.i - 1;
+      assert(scope >= 1);
+      // retrieve our closure ...
+      emit_push_closure(es);
+      // if scope is one, it's merely our closure, otherwise ...
+      if (scope > 1) {
+        // ... we must close over the closure in question ...
+        capture_t cap = find_capture(es, 0, scope);
+        bce_write(&es->bce, (bytecode) {OP_CAPTURE, {.i = cap}});
+      }
+    }
+    count++;
+
+    if (captured->second.type == DT_NIL) break;
+    assert(captured->second.type == DT_PAIR);
+    captured = captured->second.data.pair;
+  }
+
+  fun_data *f = emit_build_fun(&child);
+
+  // now allocate the closure
+  bce_write(&es->bce, (bytecode) {OP_ALLOC_CLOSURE, {.fun = f}});
+}
+
+bool lookup_binding(const pair_data *bindings,
+                    const symbol_data *name,
+                    value *result);
+
+bool lookup_var(const pair_data *env, const symbol_data *name,
+                int64_t *idx_out, int64_t *scope_out) {
+
+  const pair_data *p = env;
+  int64_t scope = 0;
+  value v;
+
+  while (p) {
+    if (p->first.type == DT_PAIR) {
+      const pair_data *ns = p->first.data.pair;
+      if (lookup_binding(ns, name, &v)) {
+        assert(v.type == DT_INT);
+        *scope_out = scope;
+        *idx_out = v.data.i;
+        return true;
+      }
+    } else {
+      assert(p->first.type == DT_NIL);
+      break;
+    }
+
+    if (p->second.type == DT_NIL) break;
+    assert(p->second.type == DT_PAIR);
+    p = p->second.data.pair;
+    scope++;
+  }
+
+  return false;
+}
+
+void emit_var(emit_state *es, value v) {
+  // try to find a binding in the current name env
+  int64_t scope, idx;
+  if (lookup_var(es->name_env, v.data.sym, &idx, &scope)) {
+    // is this from the innermost scope?
+    if (scope == 0) {
+      // simply access the local
+      bce_write(&es->bce, (bytecode) {OP_LOCAL, {.i = idx}});
+    } else {
+      // no, it will become a capture
+
+      // if the scope is merely one out, the value goes directly in our closure
+      // otherwise it is retrieved from a parent closure which we must request
+      // by placing the index in the capture list
+      capture_t cap = scope == 1
+        ? find_capture(es, v.data.sym, 0)
+        : find_capture(es, 0, scope);
+
+      // retrieve the closure
+      emit_push_closure(es);
+      // index into it
+      bce_write(&es->bce, (bytecode) {OP_CAPTURE, {.i = cap}});
+
+      // again, if the scope is > 1, the capture denotes the corresponding
+      // closure value--we must index it _twice_ to access the value
+      if (scope != 1) {
+        bce_write(&es->bce, (bytecode) {OP_CAPTURE, {.i = idx}});
+      }
+    }
+  } else {
+    // default: look at top level
+    bce_write(&es->bce, (bytecode) {OP_ID, {.sym = v.data.sym}});
+  }
+}
+
+capture_t find_capture(emit_state *es, symbol_data *name, int64_t scope) {
+  // only one of name and scope should be nonzero
+  assert(IMPLIES(name, scope == 0));
+  assert(IMPLIES(scope != 0, !name));
+  // look to see if we've already captured this id:
+  capture_t cap = 0;
+  pair_data *caps = es->capture_list;
+  while (caps) {
+    value v = caps->first;
+    if (!scope && v.type == DT_SYMBOL && v.data.sym == name) {
+      return cap;
+    } else if (!name && v.type == DT_INT && v.data.i == scope) {
+      return cap;
+    }
+    cap++;
+    if (caps->second.type == DT_NIL) break;
+    assert(caps->second.type == DT_PAIR);
+    caps = caps->second.data.pair;
+  }
+  // if we get here, the capture is new:
+  es->capture_list = new_pair(
+    name ? make_symbol(name) : make_int(scope),
+    es->capture_list ? make_pair(es->capture_list) : make_nil());
+  return cap;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1745,11 +1946,9 @@ int main(int argc, char** argv) {
       printf("\n");
 
       emit_state es;
-      emit_init(&es, 0, 0);
+      emit_init(&es, 0, 0, 0);
       emit_expr(&es, val);
       fun_data *f = emit_build_fun(&es);
-
-      dump_bytecode(fun_bytecode(f), f->bytecode_size);
 
       interp_state is;
       interp_init(&is);
@@ -1763,4 +1962,3 @@ int main(int argc, char** argv) {
     free(line);
   }
 }
-
