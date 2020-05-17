@@ -381,14 +381,12 @@ typedef struct closure_data {
   value captures[];
 } closure_data;
 
-closure_data *new_closure(fun_data *impl,
-                          value *captures) {
+closure_data *new_closure(fun_data *impl) {
   closure_data *c = checked_malloc(sizeof(closure_data) +
                                    impl->captures * sizeof(value));
   c->refcount = 1;
   c->is_native = false;
   c->impl.bc_fun = impl;
-  memcpy(c->captures, captures, sizeof(value) * impl->captures);
   return c;
 }
 
@@ -1832,11 +1830,37 @@ bool interp_one(interp_state *is) {
   case OP_CALL:
     interp_call(is, b.data.arity);
     break;
-  case OP_ALLOC_CLOSURE:
-  case OP_LOCAL:
-  case OP_CAPTURE:
-    interp_panic("unimplemented opcode 0x%x", b.opc);
+  case OP_ALLOC_CLOSURE: {
+    // alloc a closure
+    closure_data *cls = new_closure(b.data.fun);
+
+    // pop the closed-over values into the thing
+    // remember, they were pushed in reverse order, highest capture id first
+    for (size_t i = 0; i < b.data.fun->captures; i++) {
+      cls->captures[i] = interp_pop(is);
+    }
+
+    interp_push(is, make_closure(cls));
     break;
+  }
+  case OP_LOCAL: {
+    local_t id = b.data.i;
+    assert(id != 0);
+    assert(id != 1);
+    assert(IMPLIES(id < 0, -id <= (is->fp->callee.fun->arity + 1)));
+    assert(IMPLIES(id > 0, id < is->fp->callee.fun->locals));
+    value* v = (value*)is->fp + id;
+    interp_push(is, *v);
+    break;
+  }
+  case OP_CAPTURE: {
+    value v = interp_pop(is);
+    if (v.type != DT_CLOSURE) interp_panic("capture used on non-closure");
+    assert(!v.data.cls->is_native);
+    assert(b.data.i < v.data.cls->impl.bc_fun->captures);
+    interp_push(is, v.data.cls->captures[b.data.i]);
+    break;
+  }
   }
   return false;
 }
