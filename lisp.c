@@ -1388,6 +1388,8 @@ void interp_init(interp_state* is) {
 }
 
 void interp_free(interp_state* is) {
+  assert((char*)is->sp == is->stack);
+  assert((char*)is->fp == is->stack);
 }
 
 void interp_push(interp_state *is, value v) {
@@ -1400,11 +1402,11 @@ value interp_peek(interp_state *is, size_t offset) {
   return *(is->sp - offset - 1);
 }
 
-value interp_get_local(interp_state *is, local_t idx) {
+value* interp_local(interp_state *is, local_t idx) {
   assert(interp_check_invariants(is));
   assert(idx != 0 && idx != 1);
-  assert(IMPLIES(idx < 0, -idx < frame_callee_arity(is->fp)));
-  return *((value*)(is->fp) + idx);
+  assert(IMPLIES(idx < 0, -idx < frame_callee_arity(is->fp) + 1));
+  return ((value*)(is->fp) + idx);
 }
 
 value interp_pop(interp_state *is) {
@@ -1540,10 +1542,10 @@ value interp_invoke_native(interp_state *is, closure_data *cls, arity_t arity) {
   case 0:
     return ((value (*)())f->impl)();
   case 1:
-    return ((value (*)(value))f->impl)(interp_peek(is, 0));
+    return ((value (*)(value))f->impl)(*interp_local(is, -1));
   case 2:
-    return ((value (*)(value, value))f->impl)(interp_peek(is, 0),
-                                              interp_peek(is, 1));
+    return ((value (*)(value, value))f->impl)(*interp_local(is, -2),
+                                              *interp_local(is, -1));
   default:
     interp_panic("nyi: higher arities");
     break;
@@ -1551,20 +1553,25 @@ value interp_invoke_native(interp_state *is, closure_data *cls, arity_t arity) {
 }
 
 void interp_call(interp_state *is, arity_t arity) {
-  // XXX
   value fn = interp_peek(is, arity);
   if (fn.type != DT_CLOSURE) {
     interp_panic("invalid type for call: 0x%x", fn.type);
   }
 
   if (fn.data.cls->is_native) {
+    interp_push_frame(is);
+    is->fp->flags = FRAME_NATIVE;
+    is->fp->callee.native = fn.data.cls->impl.native_fun;
     value ret = interp_invoke_native(is, fn.data.cls, arity);
-    for (int i = 0; i < arity + 1; i++) {
-      interp_pop(is);
-    }
+    interp_pop_frame(is);
     interp_push(is, ret);
   } else {
-    interp_panic("nyi: non-native impls");
+    fun_data *f = fn.data.cls->impl.bc_fun;
+
+    interp_push_frame(is);
+    is->fp->flags = 0;
+    is->fp->callee.fun = fn.data.cls->impl.bc_fun;
+    is->pc = fun_bytecode(f);
   }
 }
 
@@ -1633,16 +1640,17 @@ int main(int argc, char** argv) {
                             0, /*captures*/
                             bce.start,
                             bce.buf - bce.start);
+      bce_free(&bce);
       dump_bytecode(fun_bytecode(f), f->bytecode_size);
 
       interp_state is;
       interp_init(&is);
-
       value ret = interp_enter(&is, f);
+      interp_free(&is);
+
       print(ret);
       printf("\n");
       decref_value(val);
-      bce_free(&bce);
     }
     free(line);
   }
