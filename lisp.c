@@ -32,17 +32,7 @@
  * union--that is, we'll store the data value itself (an integer, pointer to
  * string data, pointer to a cons cell, etc) along with a single byte tag saying
  * what the data will be
- *
- * In C, we're also responsible for manually managing our memory--all of our
- * data structures are expected to be heap-allocated but we still need to know
- * when to free any given structure. We'll use ref counting to manage our heap
- * memory.
  */
-
-/* Refcounts will be stored as signed ints; if the sign bit is set, we'll use
- * the sign bit to denote when an object is exempt from normal refcount
- * operations */
-#define REFCOUNT_STATIC -1
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -133,24 +123,13 @@ value make_closure(struct closure_data* cls) {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-typedef int32_t refcount_t;
-#define PERSISTENT_REFCOUNT -1;
-
-int32_t incref(int32_t rc) {
-  assert(rc != 0);
-  if (rc < 0) return rc;
-  return rc + 1;
-}
-
-int32_t decref(int32_t rc) {
-  assert(rc != 0);
-  if (rc < 0) return rc;
-  return rc - 1;
-}
-
-/* Helper functions to manage refcount */
-void incref_value(value val);
-int  decref_value(value val);
+/*
+ * In C we're responsible for managing our own heap memory--though our language
+ * is cheeky for now and _never_ frees memory!
+ *
+ * In the future we will have a garbage collector to identify and free
+ * unreferenced allocations.
+ */
 
 void *checked_malloc(size_t size) {
   void *result = malloc(size);
@@ -167,7 +146,6 @@ void *checked_malloc(size_t size) {
  * Strings will be stored as a length-prefixed buffer of characters
  */
 typedef struct string_data {
-  refcount_t refcount;
   /* The real length of the string */
   size_t length;
   /* Declaring data as an array of unknown length is a dirty trick--it lets us
@@ -186,7 +164,6 @@ string_data *new_string(const char* buf, size_t len) {
   string_data *s = checked_malloc(sizeof(string_data) + len);
   memcpy(s->data, buf, len);
   s->length = len;
-  s->refcount = 1;
   return s;
 }
 
@@ -231,14 +208,11 @@ symbol_data *new_symbol(const char *buf, size_t len) {
   string_data *str = new_string(buf, len);
   int64_t hash = string_hash(str);
   for (symbol_data *sym = g_last_symbol; sym; sym = sym->next) {
-    if (sym->hash == hash &&
-        string_equal(sym->str, str)) {
-      assert(str->refcount == 1);
+    if (sym->hash == hash && string_equal(sym->str, str)) {
       release_string(str);
       return sym;
     }
   }
-  str->refcount = PERSISTENT_REFCOUNT;
   symbol_data *sym = checked_malloc(sizeof(symbol_data));
   sym->hash = hash;
   sym->str = str;
@@ -266,22 +240,18 @@ void symbol_init_symbol_table() {
 
 /* Pairs are pretty straightforward */
 typedef struct pair_data {
-  refcount_t refcount;
   value first;
   value second;
 } pair_data;
 
 pair_data *new_pair(value v1, value v2) {
   pair_data *p = checked_malloc(sizeof(pair_data));
-  p->refcount = 1;
   p->first = v1;
   p->second = v2;
   return p;
 }
 
 void release_pair(pair_data *p) {
-  decref_value(p->first);
-  decref_value(p->second);
   free(p);
 }
 
@@ -353,7 +323,6 @@ fun_data *new_fun(string_data *name,
   fun_data *f = checked_malloc(sizeof(fun_data) +
                                sizeof(symbol_data*) * arity +
                                bytecode_size);
-  name->refcount = PERSISTENT_REFCOUNT;
   f->name = name;
   f->arity = arity;
   f->captures = captures;
@@ -372,7 +341,6 @@ typedef struct native_fun {
 ////////////////////////////////////////////////////////////////////////////////
 
 typedef struct closure_data {
-  refcount_t refcount;
   bool is_native;
   union {
     fun_data *bc_fun;
@@ -384,7 +352,6 @@ typedef struct closure_data {
 closure_data *new_closure(fun_data *impl) {
   closure_data *c = checked_malloc(sizeof(closure_data) +
                                    impl->captures * sizeof(value));
-  c->refcount = 1;
   c->is_native = false;
   c->impl.bc_fun = impl;
   return c;
@@ -393,75 +360,12 @@ closure_data *new_closure(fun_data *impl) {
 closure_data *new_native_closure(native_fun *impl) {
   closure_data *c = checked_malloc(sizeof(closure_data));
   c->is_native = true;
-  c->refcount = 1;
   c->impl.native_fun = impl;
   return c;
 }
 
 void release_closure(closure_data *c) {
-  size_t captures = c->is_native ? 0 : c->impl.bc_fun->captures;
-  for (int i = 0; i < captures; i++) {
-    decref_value(c->captures[i]);
-  }
   free(c);
-}
-
-////////////////////////////////////////////////////////////////////////////////
-
-void incref_value(value val) {
-  switch (val.type) {
-    // These types are guaranteed not to be refcounted
-  case DT_NIL:
-  case DT_BOOL:
-  case DT_INT:
-  case DT_SYMBOL:
-    return;
-  case DT_STRING:
-    val.data.str->refcount = incref(val.data.str->refcount);
-    break;
-  case DT_PAIR:
-    val.data.pair->refcount = incref(val.data.pair->refcount);
-    break;
-  case DT_CLOSURE:
-    val.data.cls->refcount = incref(val.data.cls->refcount);
-    break;
-  }
-}
-
-int decref_value(value val) {
-  switch (val.type) {
-    // These types are guaranteed not to be refcounted
-  case DT_NIL:
-  case DT_BOOL:
-  case DT_INT:
-  case DT_SYMBOL:
-    break;
-  case DT_STRING:
-    val.data.str->refcount = decref(val.data.str->refcount);
-    if (!val.data.str->refcount) {
-      release_string(val.data.str);
-      val.data.str = 0;
-      return 1;
-    }
-    break;
-  case DT_PAIR:
-    val.data.pair->refcount = decref(val.data.pair->refcount);
-    if (!val.data.pair->refcount) {
-      release_pair(val.data.pair);
-      val.data.pair = 0;
-      return 1;
-    }
-    break;
-  case DT_CLOSURE:
-    val.data.cls->refcount = decref(val.data.cls->refcount);
-    if (!val.data.cls->refcount) {
-      release_closure(val.data.cls);
-      val.data.cls = 0;
-      return 1;
-    }
-    break;
-  }
-  return 0;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -836,15 +740,8 @@ int parse_sexpr(parse_state *s, value *result) {
   /* if there was an error, we need to walk the stack and free any data
    * left behind */
   if (s->error_set) {
-    for (int i = 0; i < s->stack_top; i++) {
-      switch (s->stack[i].type) {
-      case TOK_EXPR:
-        decref_value(s->stack[i].data);
-        break;
-      default:
-        break;
-      }
-    }
+    // NOTE(jgriego) if the stack is nonempty we will leak any TOK_EXPR values
+    // that are left
     return 1;
   } else {
     /* otherwise, the stack should be empty */
@@ -1533,7 +1430,6 @@ bool lookup_binding(const pair_data *bindings, const symbol_data *name, value *r
 }
 
 void install_global_binding(pair_data **bindings, symbol_data* name, value val) {
-  incref_value(val);
   pair_data *assoc = new_pair(make_symbol(name), val);
   value rest = *bindings ? make_pair(*bindings) : make_nil();
   pair_data *p = new_pair(make_pair(assoc), rest);
@@ -1758,8 +1654,8 @@ void interp_pop_frame(interp_state *is) {
   is->pc = old->saved_pc;
   is->sp = (value*)old;
 
-  // if the frame wasn't an entry--tweak the stack by removing (but not
-  // decreffing) the closure and arguments
+  // if the frame wasn't an entry--tweak the stack by removing the closure and
+  // arguments
   if (!(old->flags & FRAME_ENTRY)) {
     is->sp -= frame_callee_arity(old) + 1;
   }
@@ -1819,8 +1715,6 @@ bool interp_one(interp_state *is) {
     interp_push(is, make_nil());
     break;
   case OP_RET: {
-    // decref locals (TODO) and params
-
     // top of stack is the return value
     value v = interp_pop(is);
     interp_pop_frame(is);
@@ -1963,7 +1857,6 @@ void interp_init_kernel(interp_state *is) {
 
 
 int main(int argc, char** argv) {
-
   symbol_init_symbol_table();
 
   parse_error err;
@@ -2005,7 +1898,6 @@ int main(int argc, char** argv) {
 
       print(ret);
       printf("\n");
-      decref_value(val);
     }
     free(line);
   }
