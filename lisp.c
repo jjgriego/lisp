@@ -1157,12 +1157,27 @@ void bce_write(bytecode_emitter *bce, bytecode b) {
   not_reached();
 }
 
+/*
+ * Bytecode emitter proper
+ *
+ * OK, here's where the fun really begins. We need to keep some state around as
+ * we lower the expression language to bytecode.
+ */
 typedef struct emit_state {
+  /* a bytecode emitter for the working bytecode */
   bytecode_emitter bce;
+  /* the arity of the func being emitted */
   arity_t arity;
+  /* the number of locals  */
   local_t locals;
+  /* a list of symbols, one for each parameter  */
   pair_data *param_names;
+  /* A list of association lists b/w symbol and int denoting the locals in
+   * scope--the first entry here is the innermost scope. The int values are the
+   * local ID of that name in the corresponding scope */
   pair_data *name_env;
+  /* A list of captures, either symbols or integers. Symbols denote a local
+     captured from the immediately surrounding scope-- */
   pair_data *capture_list;
 } emit_state;
 
@@ -1353,8 +1368,6 @@ void emit_lambda(emit_state *es, value v) {
     emit_panic(es, "lambda: bad syntax");
   }
 
-  // TODO should probably check the args are indeed a list of symbols
-
   // open an emit context for the body
   emit_state child;
   emit_init(&child, arity, arglist, es->name_env);
@@ -1437,7 +1450,7 @@ void emit_var(emit_state *es, value v) {
   if (lookup_var(es->name_env, v.data.sym, &idx, &scope)) {
     // is this from the innermost scope?
     if (scope == 0) {
-      // simply access the local
+      // yes, simply access the local
       bce_write(&es->bce, (bytecode) {OP_LOCAL, {.i = idx}});
     } else {
       // no, it will become a capture
@@ -1563,8 +1576,15 @@ typedef struct frame {
  * local IDs 0 and 1 are reserved since they alias the frame
  *
  *                  local ID
- * +--------------+
+ * +--------------+ - - - - - -
+ * |              |
+ * |  callee      |   -4
+ * |  closure     |
+ * |              |
+ * |              |
+ * +--------------+ - - - - - -
  * |  arg 0       |   -3
+ * |              |
  * |              |
  * |              |
  * |              |
@@ -1573,8 +1593,10 @@ typedef struct frame {
  * |              |
  * |              |
  * |              |
+ * |              |
  * +--------------+ - - - - - -
  * |  arg 2       |    -1
+ * |              |
  * |              |
  * |              |
  * |              |
@@ -1589,14 +1611,16 @@ typedef struct frame {
  * | and padding  |
  * +--------------+
  * | callee       |
- * |              |
+ * | func         |
  * +--------------+ - - - - - -
  * |  local 0     |     2
  * |              |
  * |              |
  * |              |
+ * |              |
  * +--------------+ - - - - - -
  * |  local 1     |     3
+ * |              |
  * |              |
  * |              |
  * |              |
