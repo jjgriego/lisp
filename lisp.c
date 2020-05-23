@@ -230,10 +230,12 @@ symbol_data *new_symbol_cstr(const char *buf) {
 
 static symbol_data *s_sym_lambda = 0;
 static symbol_data *s_sym_quote = 0;
+static symbol_data *s_sym_cond = 0;
 
 void symbol_init_symbol_table() {
   s_sym_lambda = new_symbol_cstr("lambda");
   s_sym_quote  = new_symbol_cstr("quote");
+  s_sym_cond  = new_symbol_cstr("cond");
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -315,14 +317,13 @@ char* fun_bytecode(fun_data *f) {
 }
 
 fun_data *new_fun(string_data *name,
-                  arity_t arity, pair_data *param_names,
+                  arity_t arity,
+                  pair_data *param_names,
                   local_t locals,
                   uint8_t captures,
                   const char* bytecode,
                   size_t bytecode_size) {
-  fun_data *f = checked_malloc(sizeof(fun_data) +
-                               sizeof(symbol_data*) * arity +
-                               bytecode_size);
+  fun_data *f = checked_malloc(sizeof(fun_data) + bytecode_size);
   f->name = name;
   f->arity = arity;
   f->captures = captures;
@@ -377,6 +378,7 @@ void release_closure(closure_data *c) {
  *
  * <s-expr> ::= <int>
  *            | <string-lit>
+ *            | #t | #f
  *            | <id>
  *            | (<s-expr> ...)
  *            | '<s-expr>
@@ -671,6 +673,19 @@ int parse_sexpr(parse_state *s, value *result) {
       }
       break;
     }
+    case '#': {
+      srcloc start = s->loc;
+      parse_advance(s);
+      char c = parse_advance(s);
+      if (c == 't') {
+        parse_push_expr(s, start, make_bool(true));
+      } else if (c == 'f') {
+        parse_push_expr(s, start, make_bool(false));
+      } else {
+        parse_raise_error(s, "unknown # literal");
+      }
+      break;
+    }
     case '0':
     case '1':
     case '2':
@@ -850,9 +865,12 @@ enum opcode {
   OP_CAPTURE,      // capture $id
   /* Pop a closure from the stack and retrieve the capture value with the given
    * index */
-  OP_ALLOC_CLOSURE // alloc_closure $fun
+  OP_ALLOC_CLOSURE,// alloc_closure $fun
   /* Alloc a closure with the given function, popping $fun->captures additional
    * values off the stack to form the closed-over identifiers  */
+  OP_JMP,          // jmp $offset
+  OP_JNZ,          // jnz $offset
+  OP_JZ,           // jz
 };
 
 /*
@@ -864,13 +882,14 @@ enum opcode {
  *          | <symbol>                    -- variable reference
  *          | (<expr> <expr> ...)         -- function application
  *          | (lambda (param ...) <expr>) -- function abstraction
+ *          | (cond (<expr> <expr>) ...)  -- conditional
  */
 
 typedef struct bytecode {
   enum opcode opc;
   union {
-    arity_t arity;           // OP_CALL
-    int64_t i;               // OP_INT, OP_BOOL
+    arity_t arity;    // OP_CALL
+    int64_t i;        // OP_INT, OP_BOOL, OP_J{NZ,Z}
     string_data *str; // OP_STRING
     symbol_data *sym; // OP_SYMBOL, OP_ID
     pair_data *pair;  // OP_PAIR
@@ -888,6 +907,9 @@ const char* read_bytecode(const char* buf, bytecode* ret) {
   case OP_INT:
   case OP_LOCAL:
   case OP_CAPTURE:
+  case OP_JMP:
+  case OP_JZ:
+  case OP_JNZ:
     ret->data.i = *(const int64_t*)buf;
     buf += sizeof(int64_t);
     break;
@@ -920,45 +942,57 @@ void dump_opcode(bytecode b) {
   switch (b.opc) {
   case OP_NIL:
     printf("nil");
-    break;
+    return;
   case OP_RET:
     printf("ret");
-    break;
+    return;
   case OP_BOOL:
     printf("bool 0x%" PRIx64, b.data.i);
-    break;
+    return;
   case OP_STRING:
     printf("string 0x%" PRIxPTR " # ", (uintptr_t)b.data.str);
     print(make_string(b.data.str));
-    break;
+    return;
   case OP_ID:
     printf("id 0x%" PRIxPTR " # ", (uintptr_t)b.data.sym);
     print(make_symbol(b.data.sym));
-    break;
+    return;
   case OP_LOCAL:
     printf("local 0x%" PRIx64, b.data.i);
-    break;
+    return;
   case OP_CAPTURE:
     printf("capture 0x%" PRIx64, b.data.i);
-    break;
+    return;
   case OP_SYMBOL:
     printf("symbol 0x%" PRIxPTR " # ", (uintptr_t)b.data.sym);
     print(make_symbol(b.data.sym));
-    break;
+    return;
   case OP_INT:
     printf("int 0x%" PRIx64, b.data.i);
-    break;
+    return;
   case OP_PAIR:
     printf("pair 0x%" PRIxPTR " # ", (uintptr_t)b.data.pair);
     print(make_pair(b.data.pair));
-    break;
+    return;
   case OP_CALL:
     printf("call %d", b.data.arity);
-    break;
+    return;
   case OP_ALLOC_CLOSURE:
     printf("alloc_closure 0x%" PRIxPTR, (uintptr_t)b.data.fun);
-    break;
+    return;
+  case OP_JMP:
+    printf("jmp 0x%" PRIx64, b.data.i);
+    return;
+  case OP_JZ:
+    printf("jz 0x%" PRIx64, b.data.i);
+    return;
+  case OP_JNZ:
+    printf("jnz 0x%" PRIx64, b.data.i);
+    return;
   }
+
+  printf("< invalid 0x%hhx >", (char)b.opc);
+
 }
 
 void dump_bytecode(const char* buf, size_t len) {
@@ -968,8 +1002,9 @@ void dump_bytecode(const char* buf, size_t len) {
   printf("bytecode (start %" PRIxPTR ", length %" PRIx64 ")\n",
          (uintptr_t)buf, len);
   while (data < buf + len) {
+    size_t offset = data - buf;
     data = read_bytecode(data, &b);
-    printf("%zu\t", data - buf);
+    printf("%zu\t", offset);
     dump_opcode(b);
     printf("\n");
   }
@@ -1013,6 +1048,10 @@ void bce_free(bytecode_emitter *bce) {
   if (bce->start) free(bce->start);
 }
 
+size_t bce_offset(bytecode_emitter *bce) {
+  return bce->buf - bce->start;
+}
+
 void bce_write(bytecode_emitter *bce, bytecode b) {
   if (bce->buf - bce->start + sizeof(bytecode) <= bce->cap) {
     bce_grow(bce);
@@ -1025,6 +1064,9 @@ void bce_write(bytecode_emitter *bce, bytecode b) {
   case OP_BOOL:
   case OP_LOCAL:
   case OP_CAPTURE:
+  case OP_JMP:
+  case OP_JZ:
+  case OP_JNZ:
     *(int64_t *)(bce->buf) = b.data.i;
     bce->buf += sizeof(int64_t);
     return;
@@ -1052,6 +1094,21 @@ void bce_write(bytecode_emitter *bce, bytecode b) {
   }
 
   not_reached();
+}
+
+size_t bce_write_branch(bytecode_emitter *bce, bytecode b) {
+  assert(b.opc == OP_JMP || b.opc == OP_JZ || b.opc == OP_JNZ);
+  size_t off = bce_offset(bce);
+  bce_write(bce, b);
+  return off;
+}
+
+void bce_patch_branch(bytecode_emitter *bce, size_t branch_off, size_t dst_off) {
+  char *ptr = bce->start + branch_off;
+  enum opcode opc = *(enum opcode *)ptr;
+  assert(opc == OP_JMP || opc == OP_JZ || opc == OP_JNZ);
+  int64_t *offset_ptr = (int64_t *)(ptr + 1);
+  *offset_ptr = ((int64_t)dst_off) - (branch_off + sizeof(int64_t) + 1);
 }
 
 /*
@@ -1167,6 +1224,7 @@ void emit_expr(emit_state *es, value v);
 void emit_lambda(emit_state *es, value v);
 void emit_funcall(emit_state *es, value v);
 void emit_var(emit_state *es, value v);
+void emit_cond(emit_state *es, value v);
 
 void emit_push_closure(emit_state *es) {
   bce_write(&es->bce, (bytecode) {OP_LOCAL, {.i = -es->arity - 1}});
@@ -1221,6 +1279,10 @@ void emit_expr(emit_state *es, value v) {
             emit_panic(es, "bad quote");
           }
         }
+        break;
+      } else if (s == s_sym_cond) {
+        emit_cond(es, v);
+        break;
       }
     }
     emit_funcall(es, v);
@@ -1256,6 +1318,49 @@ void emit_funcall(emit_state *es, value v) {
   }
 
   bce_write(&es->bce, (bytecode) {OP_CALL, { .arity = (arity_t)arity }});
+}
+
+void emit_cond(emit_state *es, value v) {
+  assert(v.type == DT_PAIR);
+
+  size_t branches;
+  if (!list_length(v.data.pair, &branches) || branches < 2) {
+    emit_panic(es, "bad syntax");
+  }
+
+  size_t *fixups = checked_malloc(sizeof(size_t) * branches);
+
+  // for each branch
+  pair_data *p = v.data.pair;
+  for (size_t i = 0; i < branches - 1; i++) {
+    p = p->second.data.pair;
+    assert(p->first.type == DT_PAIR);
+    size_t n;
+    if (!list_length(p->first.data.pair, &n) || n != 2) {
+      emit_panic(es, "bad syntax");
+    }
+    pair_data *label = p->first.data.pair;
+
+    // enit the expression
+    emit_expr(es, label->first);
+    // if it's false, jump to the next test
+    size_t off = bce_write_branch(&es->bce, (bytecode) {OP_JZ});
+    // otherwise, push the result and jump to the end
+    emit_expr(es, label->second.data.pair->first);
+    fixups[i] = bce_write_branch(&es->bce, (bytecode) {OP_JMP});
+    bce_patch_branch(&es->bce, off, bce_offset(&es->bce));
+  }
+
+  // default result is nil
+  bce_write(&es->bce, (bytecode) {OP_NIL});
+
+  // now that we know the end offset, patch it into all the jmps
+  size_t end_offset = bce_offset(&es->bce);
+  for (size_t i = 0; i < branches - 1; i++) {
+    bce_patch_branch(&es->bce, fixups[i], end_offset);
+  }
+
+  free(fixups);
 }
 
 void emit_lambda(emit_state *es, value v) {
@@ -1666,7 +1771,7 @@ void interp_pop_frame(interp_state *is) {
   assert(interp_check_invariants(is));
 }
 
-bool interp_one(interp_state *is);
+void interp_one(interp_state *is);
 
 /* Configure the vm stack to call the given function with no arguments and then
  * run the interpreter until the function returns */
@@ -1702,9 +1807,14 @@ value interp_enter(interp_state* is, fun_data* callee) {
 }
 
 
+void interp_jump(interp_state *is, int64_t offset);
 void interp_call(interp_state *is, arity_t arity);
 
-bool interp_one(interp_state *is) {
+bool interp_is_falsey(value v) {
+  return v.type == DT_BOOL && v.data.i == 0;
+}
+
+void interp_one(interp_state *is) {
   bytecode b;
   is->pc = read_bytecode(is->pc, &b);
   printf("interp: ");
@@ -1713,29 +1823,29 @@ bool interp_one(interp_state *is) {
   switch (b.opc) {
   case OP_NIL:
     interp_push(is, make_nil());
-    break;
+    return;
   case OP_RET: {
     // top of stack is the return value
     value v = interp_pop(is);
     interp_pop_frame(is);
     interp_push(is, v);
-    break;
+    return;
   }
   case OP_INT:
     interp_push(is, make_int(b.data.i));
-    break;
+    return;
   case OP_BOOL:
     interp_push(is, make_bool(b.data.i));
-    break;
+    return;
   case OP_STRING:
     interp_push(is, make_string(b.data.str));
-    break;
+    return;
   case OP_SYMBOL:
     interp_push(is, make_symbol(b.data.sym));
-    break;
+    return;
   case OP_PAIR:
     interp_push(is, make_pair(b.data.pair));
-    break;
+    return;
   case OP_ID: {
     value v;
     if (!lookup_binding(is->global_bindings, b.data.sym, &v)) {
@@ -1744,10 +1854,10 @@ bool interp_one(interp_state *is) {
                    b.data.sym->str->data);
     }
     interp_push(is, v);
-  } break;
+  } return;
   case OP_CALL:
     interp_call(is, b.data.arity);
-    break;
+    return;
   case OP_ALLOC_CLOSURE: {
     // alloc a closure
     closure_data *cls = new_closure(b.data.fun);
@@ -1759,7 +1869,7 @@ bool interp_one(interp_state *is) {
     }
 
     interp_push(is, make_closure(cls));
-    break;
+    return;
   }
   case OP_LOCAL: {
     local_t id = b.data.i;
@@ -1769,7 +1879,7 @@ bool interp_one(interp_state *is) {
     assert(IMPLIES(id > 0, id < is->fp->callee.fun->locals));
     value* v = (value*)is->fp + id;
     interp_push(is, *v);
-    break;
+    return;
   }
   case OP_CAPTURE: {
     value v = interp_pop(is);
@@ -1777,10 +1887,23 @@ bool interp_one(interp_state *is) {
     assert(!v.data.cls->is_native);
     assert(b.data.i < v.data.cls->impl.bc_fun->captures);
     interp_push(is, v.data.cls->captures[b.data.i]);
-    break;
+    return;
+  }
+  case OP_JMP:
+    interp_jump(is, b.data.i);
+    return;
+  case OP_JZ: {
+    value v = interp_pop(is);
+    if (interp_is_falsey(v)) interp_jump(is, b.data.i);
+    return;
+  }
+  case OP_JNZ: {
+    value v = interp_pop(is);
+    if (!interp_is_falsey(v)) interp_jump(is, b.data.i);
+    return;
   }
   }
-  return false;
+  interp_panic("invalid opcode");
 }
 
 value interp_invoke_native(interp_state *is, closure_data *cls, arity_t arity) {
@@ -1828,6 +1951,11 @@ void interp_call(interp_state *is, arity_t arity) {
     is->fp->callee.fun = fn.data.cls->impl.bc_fun;
     is->pc = fun_bytecode(f);
   }
+}
+
+void interp_jump(interp_state *is, int64_t offset) {
+  is->pc += offset;
+  assert(interp_check_invariants(is));
 }
 
 typedef struct native_fn_table_entry {
