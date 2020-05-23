@@ -1014,7 +1014,7 @@ void bce_free(bytecode_emitter *bce) {
 }
 
 void bce_write(bytecode_emitter *bce, bytecode b) {
-  if (bce->buf - bce->start <= sizeof(bytecode)) {
+  if (bce->buf - bce->start + sizeof(bytecode) <= bce->cap) {
     bce_grow(bce);
   }
   *(bce->buf++) = b.opc;
