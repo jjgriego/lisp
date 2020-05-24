@@ -179,7 +179,7 @@ uint64_t string_hash(const string_data* str) {
   /* WARNING: very dumb hash algorithm ahead: */
   uint64_t val = 0;
   for (int i = 0; i < str->length; i++) {
-    val = (val << 8) + str->data[i] * (val >> 56);
+    val = (val << 8) + (uint64_t)str->data[i] * (val >> 56);
   }
   return val;
 }
@@ -197,7 +197,7 @@ int string_equal(const string_data* str1, const string_data *str2) {
  * will also store a hash of their string data
  */
 typedef struct symbol_data {
-  size_t hash;
+  uint64_t hash;
   string_data *str;
   struct symbol_data *next;
 } symbol_data;
@@ -206,7 +206,7 @@ symbol_data *g_last_symbol = 0;
 
 symbol_data *new_symbol(const char *buf, size_t len) {
   string_data *str = new_string(buf, len);
-  int64_t hash = string_hash(str);
+  uint64_t hash = string_hash(str);
   for (symbol_data *sym = g_last_symbol; sym; sym = sym->next) {
     if (sym->hash == hash && string_equal(sym->str, str)) {
       release_string(str);
@@ -299,8 +299,12 @@ bool list_length(pair_data *list_head, size_t* result) {
  */
 
 typedef uint8_t arity_t;
+#define MAX_ARITY UINT8_MAX
 typedef int16_t local_t;
+#define MAX_LOCALS INT16_MAX
 typedef uint16_t capture_t;
+#define MAX_CAPTURES UINT16_MAX
+
 typedef struct fun_data {
   string_data *name;
   capture_t captures;
@@ -310,7 +314,6 @@ typedef struct fun_data {
   pair_data *param_names;
 } fun_data;
 
-#define MAX_ARITY 0x100
 
 char* fun_bytecode(fun_data *f) {
   return (char*)(f + 1);
@@ -320,7 +323,7 @@ fun_data *new_fun(string_data *name,
                   arity_t arity,
                   pair_data *param_names,
                   local_t locals,
-                  uint8_t captures,
+                  capture_t captures,
                   const char* bytecode,
                   size_t bytecode_size) {
   fun_data *f = checked_malloc(sizeof(fun_data) + bytecode_size);
@@ -583,7 +586,7 @@ int parse_number(parse_state *s, int64_t *result) {
 int parse_string(parse_state *s, string_data **result) {
   size_t start = s->loc.off + 1;
   size_t end = 0;
-  for (int i = 0; i < s->len; i++) {
+  for (size_t i = 0; i < s->len; i++) {
     if (s->buf[i] == '\"') {
       end = i;
       break;
@@ -649,7 +652,7 @@ int parse_sexpr(parse_state *s, value *result) {
         /* everything from (top + 1) to old_top needs to go into a list
          * now */
         value v = make_nil();
-        for (int i = old_top - 1; i > top; i--) {
+        for (size_t i = old_top - 1; i > top; i--) {
           /* assert the element at stack[i] is a TOK_EXPR */
           value v2;
           if (parse_get_expr_at(s, &v2, i)) {
@@ -1002,7 +1005,7 @@ void dump_bytecode(const char* buf, size_t len) {
   printf("bytecode (start %" PRIxPTR ", length %" PRIx64 ")\n",
          (uintptr_t)buf, len);
   while (data < buf + len) {
-    size_t offset = data - buf;
+    size_t offset = (size_t)(data - buf);
     data = read_bytecode(data, &b);
     printf("%zu\t", offset);
     dump_opcode(b);
@@ -1032,8 +1035,10 @@ void bce_init(bytecode_emitter *bce) {
   bce->buf = bce->start;
 }
 
+size_t bce_offset(bytecode_emitter *bce);
+
 void bce_grow(bytecode_emitter *bce) {
-  size_t off = bce->buf - bce->start;
+  size_t off = bce_offset(bce);
   bce->cap *= 2;
   char* buf = realloc(bce->start, bce->cap);
   bce->start = buf;
@@ -1049,11 +1054,11 @@ void bce_free(bytecode_emitter *bce) {
 }
 
 size_t bce_offset(bytecode_emitter *bce) {
-  return bce->buf - bce->start;
+  return (size_t)(bce->buf - bce->start);
 }
 
 void bce_write(bytecode_emitter *bce, bytecode b) {
-  if (bce->buf - bce->start + sizeof(bytecode) <= bce->cap) {
+  if (bce_offset(bce) + sizeof(bytecode) <= bce->cap) {
     bce_grow(bce);
   }
   *(bce->buf++) = b.opc;
@@ -1108,7 +1113,7 @@ void bce_patch_branch(bytecode_emitter *bce, size_t branch_off, size_t dst_off) 
   enum opcode opc = *(enum opcode *)ptr;
   assert(opc == OP_JMP || opc == OP_JZ || opc == OP_JNZ);
   int64_t *offset_ptr = (int64_t *)(ptr + 1);
-  *offset_ptr = ((int64_t)dst_off) - (branch_off + sizeof(int64_t) + 1);
+  *offset_ptr = (int64_t)dst_off - (int64_t)(branch_off + sizeof(int64_t) + 1);
 }
 
 /*
@@ -1150,7 +1155,7 @@ void emit_init(emit_state *es,
   }
 
   { // extend the naming env with the parameters
-    local_t idx = -arity;
+    local_t idx = (local_t)(-arity);
     pair_data *env = 0;
     pair_data *params = param_names;
     while (params) {
@@ -1194,18 +1199,20 @@ void emit_free(emit_state *es) {
 fun_data *emit_build_fun(emit_state *es) {
   bce_write(&es->bce, (bytecode) {OP_RET});
 
-  size_t cap = 0;;
+  size_t cap = 0;
   if (es->capture_list && !list_length(es->capture_list, &cap)) {
     emit_panic(es, "capture list is improper");
   }
+
+  assert(cap < MAX_CAPTURES);
 
   fun_data *f = new_fun(new_string_cstr("<eval>"),
                         es->arity,
                         es->param_names,
                         0, /* locals */
-                        cap,
+                        (capture_t)cap,
                         es->bce.start,
-                        es->bce.buf - es->bce.start);
+                        (size_t)(es->bce.buf - es->bce.start));
 
   emit_free(es);
 
@@ -1370,9 +1377,11 @@ void emit_lambda(emit_state *es, value v) {
     emit_panic(es, "lambda: bad syntax");
   }
 
+  assert(arity < MAX_ARITY);
+
   // open an emit context for the body
   emit_state child;
-  emit_init(&child, arity, arglist, es->name_env);
+  emit_init(&child, (arity_t)arity, arglist, es->name_env);
 
   // XXX: ugh this style
   emit_expr(&child, v.data.pair->second.data.pair->second.data.pair->first);
@@ -1876,7 +1885,7 @@ void interp_one(interp_state *is) {
     return;
   }
   case OP_LOCAL: {
-    local_t id = b.data.i;
+    local_t id = (local_t)b.data.i;
     assert(id != 0);
     assert(id != 1);
     assert(IMPLIES(id < 0, -id <= (is->fp->callee.fun->arity + 1)));
@@ -2005,7 +2014,7 @@ int main(int argc, char** argv) {
       abort();
     }
 
-    if (parse(line, len, &err, &val)) {
+    if (parse(line, (size_t)len, &err, &val)) {
       printf("error at (line %d, col %d, offset %ld)\n",
              err.loc.line, err.loc.column, err.loc.off);
       if (fwrite(err.message->data, 1, err.message->length, stdout) <
