@@ -889,7 +889,7 @@ typedef struct bytecode {
   enum opcode opc;
   union {
     arity_t arity;    // OP_CALL
-    int64_t i;        // OP_INT, OP_BOOL, OP_J{NZ,Z}
+    int64_t i;        // OP_INT, OP_BOOL, OP_J{MP, NZ, Z}
     string_data *str; // OP_STRING
     symbol_data *sym; // OP_SYMBOL, OP_ID
     pair_data *pair;  // OP_PAIR
@@ -1695,6 +1695,10 @@ value interp_native_sub(value v1, value v2) {
   return make_int(v1.data.i - v2.data.i);
 }
 
+value interp_native_zerop(value v1) {
+  return make_bool(v1.type == DT_INT && v1.data.i == 0);
+}
+
 
 void interp_init_kernel(interp_state *is);
 
@@ -1967,6 +1971,7 @@ const native_fn_table_entry s_native_fn_table[] =
   {{"+", 2, interp_native_add},
    {"-", 2, interp_native_sub},
    {"*", 2, interp_native_mul},
+   {"zero?", 1, interp_native_zerop},
    {0}};
 
 void interp_init_kernel(interp_state *is) {
