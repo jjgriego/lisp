@@ -1998,7 +1998,7 @@ int main(int argc, char** argv) {
   while (1) {
     char *line = NULL;
     size_t cap = 0;
-    size_t len = 0;
+    ssize_t len = 0;
     if ((len = getline(&line, &cap, stdin)) < 0) {
       if (feof(stdin)) break;
       perror("could not read line");
